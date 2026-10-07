@@ -78,10 +78,19 @@ const API = {
     const q = version ? `?version=${version}` : "";
     return this._req(`/api/challenges/${cid}/leaderboard${q}`);
   },
-  reviewQueue() { return this._req("/api/challenges/review_queue"); },
-  reviewSubmission(recordId, action, note) {
-    return this._req(`/api/challenges/submissions/${recordId}/review`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
+  reviewQueue(level, overdue) {
+    let q = [];
+    if (level) q.push(`level=${level}`);
+    if (overdue === true) q.push("overdue=true");
+    const qs = q.length ? `?${q.join("&")}` : "";
+    return this._req(`/api/challenges/review_queue${qs}`);
+  },
+  reviewSubmission(recordId, action, note, level, token) {
+    const qs = level ? `?level=${level}` : "";
+    return this._req(`/api/challenges/submissions/${recordId}/review${qs}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json",
+                 ...(token ? { "X-Reviewer-Token": token } : {}) },
       body: JSON.stringify({ action, note: note || "" }),
     });
   },
@@ -89,14 +98,18 @@ const API = {
     return this._req(`/api/challenges/submissions/${recordId}`);
   },
 
+  // ---- 审核账号 ----
+  reviewers() { return this._req("/api/challenges/reviewers"); },
+
   // ---- 申诉与复核链路 ----
   // 审核凭证：初审/复核共用 X-Reviewer-Token（缺省入口降级为内置初审员）
   reviewerMe() { return this._req("/api/challenges/reviewers/me"); },
   reviewQueueStatus(status) {
     return this._req(`/api/challenges/review_queue?status=${status}`);
   },
-  appealsQueue(status = "pending") {
-    return this._req(`/api/challenges/appeals?status=${status}`);
+  appealsQueue(status = "pending", level = null) {
+    const lv = level ? `&level=${level}` : "";
+    return this._req(`/api/challenges/appeals?status=${status}${lv}`);
   },
   appealSubmission(recordId, player, reason, appealId) {
     return this._req(`/api/challenges/submissions/${recordId}/appeal`, {

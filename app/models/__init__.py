@@ -97,6 +97,8 @@ class ChallengeVersion(Base):
     budget_dv = Column(Float, nullable=False)
     t_max = Column(Float, nullable=False)
     milestones_json = Column(Text, nullable=False, default="[]")
+    # 多级审核链配置（空串 = 旧版默认单级：初审员一审、申诉走复核员队列）
+    review_pipeline_json = Column(Text, nullable=False, default="")
     created_at = Column(Float, nullable=False, default=time.time)
 
 
@@ -133,6 +135,9 @@ class ChallengeSubmission(Base):
     审核状态/排行榜/轨迹回放始终锚定提交时指定的挑战。
     审核状态 pending → approved/rejected；只有 approved 的成绩才进入排行榜、
     开放轨迹回放，并计入关卡解锁条件。
+    多级审核：pending 期间 review_level 为当前所处审核级（1 起）；逐级通过至
+    超过链上级数时终审 approved。review_stage_entered_at 为进入当前级的时间戳，
+    配合该版本的级时限产出 SLA 超时标记。旧存档两者为空 = 默认单级链路。
     """
     __tablename__ = "challenge_submission"
     __table_args__ = (
@@ -151,6 +156,8 @@ class ChallengeSubmission(Base):
     elapsed_days = Column(Float, nullable=False, default=0.0)
     review_status = Column(String(16), nullable=False, default="pending", index=True)
     # pending=待审(含申诉重审) approved=已通过(上榜/回放/解锁) rejected=已驳回 revoked=已撤销上榜
+    review_level = Column(Integer, nullable=True)  # 当前待审级（1 起）；终审后为终审级；旧存档为空=默认单级
+    review_stage_entered_at = Column(Float, nullable=True)  # 进入当前级的时间（SLA 时限起算）
     review_note = Column(String(200), nullable=False, default="")
     reviewed_by = Column(String(24), nullable=True)  # 终审审核员署名（旧存档为空=历史审核）
     reviewed_at = Column(Float, nullable=True)
@@ -180,6 +187,10 @@ class ChallengeAppeal(Base):
     appeal_uid 为客户端生成的幂等键（双击/重试只受理一次）；每条成绩最多
     MAX_APPEAL_ROUNDS 轮、同时仅一条待裁决申诉。申诉期间成绩回到 pending
     进入复核队列；复核维持(uphold)回到 from_status，推翻(overturn)改判通过。
+
+    多级审核下，申诉进入“正确的队列”：被某一级驳回就在该级重审
+    （target_level = 该驳回级，由该级指定审核人在普通审核接口裁决）；
+    target_level 为空表示旧版默认链路——统一由复核员在复核裁决接口处理。
     """
     __tablename__ = "challenge_appeal"
 
@@ -189,6 +200,9 @@ class ChallengeAppeal(Base):
                            nullable=False, index=True)
     round = Column(Integer, nullable=False, default=1)  # 第几轮申诉（1、2）
     from_status = Column(String(16), nullable=False)    # 申诉时成绩状态（uphold 时回到它）
+    # 申诉重审进入的审核级：多级链路为驳回/撤销发生的级别（走该级审核队列）；
+    # 空 = 旧版默认链路，统一由复核员裁决
+    target_level = Column(Integer, nullable=True, index=True)
     player = Column(String(24), nullable=False, default="匿名飞行员")
     reason = Column(String(500), nullable=False, default="")
     # pending=待复核 approved=复核推翻原判(改判通过) rejected=复核维持原判
@@ -212,7 +226,8 @@ class ChallengeReviewEvent(Base):
                            nullable=False, index=True)
     appeal_id = Column(Integer, ForeignKey("challenge_appeal.id"),
                        nullable=True, index=True)
-    # submit/review_approve/review_reject/appeal/appeal_uphold/appeal_overturn/
+    # submit/review_approve(终审通过)/review_advance(逐级通过)/
+    # review_reject/appeal/appeal_uphold/appeal_overturn/
     # revoke/restore/legacy
     kind = Column(String(24), nullable=False)
     actor = Column(String(24), nullable=False, default="")

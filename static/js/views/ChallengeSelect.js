@@ -19,6 +19,10 @@ window.ChallengeSelect = {
       timeline: null,
       timelineLoading: false,
       moderatorToken: Store.get("modToken") || "local-moderator",
+      reviewerToken: Store.get("reviewerToken") || "",
+      queueLevel: null,       // null=全部待审；数字=仅该审核级
+      queueOverdueOnly: false,
+      reviewerList: [],       // 可被指定到审核级的已注册审核账号
       actionErr: "",
     };
   },
@@ -63,18 +67,32 @@ window.ChallengeSelect = {
     },
     eventLabel(k) {
       return {
-        submit: "玩家提交", review_approve: "初审通过", review_reject: "初审驳回",
+        submit: "玩家提交", review_approve: "终审通过·上榜",
+        review_advance: "通过本级·流转下一级", review_reject: "审核驳回",
         appeal: "玩家申诉", appeal_uphold: "复核维持原判",
-        appeal_overturn: "复核推翻·改判通过", revoke: "复核撤销上榜",
+        appeal_overturn: "申诉推翻·继续审核", revoke: "复核撤销上榜",
         restore: "复核恢复上榜", legacy: "历史已审核（补登）",
       }[k] || k;
     },
     eventDetail(e) {
       const d = e.detail || {};
-      if (e.kind === "submit") return `★${d.stars} · 服务端结算`;
-      if (e.kind === "appeal") return `第 ${d.round} 轮（原判 ${this.statusLabel(d.from_status)}）：${d.reason || ""}`;
+      if (e.kind === "submit")
+        return `★${d.stars} · 服务端结算` + (d.level ? ` · 进入第 ${d.level} 级队列` : "");
+      if (e.kind === "review_advance")
+        return `第 ${d.from_level} 级「${d.from_stage}」通过 → 第 ${d.to_level} 级「${d.to_stage}」`
+          + (d.note ? `：${d.note}` : "");
+      if (e.kind === "review_approve")
+        return `第 ${d.level} 级「${d.stage}」终审通过（共 ${d.total_levels} 级）`
+          + (d.note ? `：${d.note}` : "");
+      if (e.kind === "review_reject")
+        return `第 ${d.level} 级「${d.stage}」驳回` + (d.note ? `：${d.note}` : "");
+      if (e.kind === "appeal")
+        return `第 ${d.round} 轮（原判 ${this.statusLabel(d.from_status)}`
+          + (d.target_stage ? `，回到第 ${d.target_level} 级「${d.target_stage}」` : "，进复核队列")
+          + `）：${d.reason || ""}`;
       if (e.kind === "appeal_uphold" || e.kind === "appeal_overturn")
-        return `第 ${d.round} 轮${d.note ? "：" + d.note : ""}`;
+        return `第 ${d.round} 轮` + (d.stage ? ` · 第 ${d.level} 级「${d.stage}」` : "")
+          + (d.note ? `：${d.note}` : "");
       return d.note || "";
     },
     enter(c) { if (c.unlocked) this.$emit("enter", c); },
@@ -88,11 +106,45 @@ window.ChallengeSelect = {
         budgetKm: 8.0, tMax: 1200,
         milestones: [{ kind: "proximity", planet_id: "mars", dist: 0.18, r: 4.2, name: "" }],
         unlock: { type: "none", level_id: 1, challenge_id: null, value: 5 },
+        // null=使用默认（新建=默认单级；新版=沿用上版）；[]=显式配置的审核级列表
+        pipelineEnabled: false,
+        pipelineProvided: false,  // 是否随请求显式传 review_pipeline
+        stages: [{ name: "", role: "reviewer", reviewers: [], hours: null }],
       };
     },
-    openPublish(ch) {
+    async loadReviewers() {
+      try {
+        this.reviewerList = (await API.reviewers()).reviewers || [];
+      } catch (e) { this.reviewerList = []; }
+    },
+    reviewerOptions(stage) {
+      // 复核级只列复核员；初审级列出全部（moderator 可兜底任意级）
+      return this.reviewerList.filter(r =>
+        stage.role !== "moderator" || r.role === "moderator");
+    },
+    addStage() {
+      this.form.stages.push(
+        { name: "", role: this.form.stages.length ? "moderator" : "reviewer",
+          reviewers: [], hours: null });
+    },
+    removeStage(i) {
+      this.form.stages.splice(i, 1);
+      this.form.stages.forEach((s, idx) => { if (!s.name) s.name = ""; });
+    },
+    onPipelineToggle(on) {
+      this.form.pipelineEnabled = on;
+      this.form.pipelineProvided = true;
+      if (on && !this.form.stages.length) this.addStage();
+    },
+    onStageRole(stage) {
+      // 角色切换后清掉不再合法的已选审核人
+      const valid = new Set(this.reviewerOptions(stage).map(r => r.name));
+      stage.reviewers = (stage.reviewers || []).filter(n => valid.has(n));
+    },
+    async openPublish(ch) {
       const f = this.blankForm();
       this.publishErr = "";
+      this.loadReviewers();
       if (!ch) { this.form = f; this.mode = "publish"; return; }
       // 发布新版本：拉取当前版本定义预填，在其上修改
       f.mode = "version"; f.targetId = ch.id; f.targetTitle = ch.title;
@@ -109,6 +161,16 @@ window.ChallengeSelect = {
           dist: m.dist || 0.18, r: m.r || 4.2,
         }));
         if (d.unlock_rule) f.unlock = { level_id: 1, value: 5, challenge_id: null, ...d.unlock_rule };
+        // 预填当前版本审核链：默认单级显示为“默认（不传）”，显式链展开编辑器
+        const p = v.review_pipeline || { legacy: true, stages: [] };
+        if (!p.legacy && p.stages && p.stages.length) {
+          f.pipelineEnabled = true;
+          f.pipelineProvided = true;
+          f.stages = p.stages.map(s => ({
+            name: s.name || "", role: s.role || "reviewer",
+            reviewers: s.reviewers || [], hours: s.time_limit_hours ?? null,
+          }));
+        }
       }).catch(e => { this.publishErr = e.message; });
     },
     addMs() {
@@ -140,13 +202,33 @@ window.ChallengeSelect = {
         }),
       };
       const rule = f.unlock.type === "none" ? { type: "none" } : { ...f.unlock };
+      const payload = { ...def, unlock_rule: rule };
+      // 审核链：仅在设计者显式操作过时随请求发送；
+      // 关闭自定义 → 显式 null（回到默认单级）；开启 → 各级配置
+      if (f.pipelineProvided) {
+        if (!f.pipelineEnabled) {
+          payload.review_pipeline = null;
+        } else {
+          if (!f.stages.length) {
+            this.publishErr = "请至少配置一个审核级，或关闭「自定义多级审核」";
+            return;
+          }
+          payload.review_pipeline = f.stages.map(s => ({
+            name: (s.name || "").trim(),
+            role: s.role,
+            reviewers: s.reviewers || [],
+            time_limit_hours: (s.hours === null || s.hours === "" || isNaN(s.hours))
+              ? null : Number(s.hours),
+          }));
+        }
+      }
       this.publishing = true;
       this.publishErr = "";
       try {
         if (f.mode === "create") {
-          await API.createChallenge({ title: f.title, author: f.author, ...def, unlock_rule: rule });
+          await API.createChallenge({ title: f.title, author: f.author, ...payload });
         } else {
-          await API.publishVersion(f.targetId, { ...def, unlock_rule: rule });
+          await API.publishVersion(f.targetId, payload);
         }
         Store.set("designer", f.author);
         this.mode = "list";
@@ -171,8 +253,10 @@ window.ChallengeSelect = {
       this.actionErr = "";
       try {
         if (tab === "queue") {
-          this.queue = (await API.reviewQueue()).submissions || [];
+          this.queue = (await API.reviewQueue(
+            this.queueLevel, this.queueOverdueOnly)).submissions || [];
         } else if (tab === "appeals") {
+          // 复核员旧队列：只看未路由的默认链路申诉
           this.appeals = (await API.appealsQueue("pending")).appeals || [];
         } else if (tab === "archive") {
           this.archive = (await API.reviewQueueStatus(this.archiveStatus)).submissions || [];
@@ -185,6 +269,30 @@ window.ChallengeSelect = {
       } finally {
         this.queueLoading = false;
       }
+    },
+    stageOf(r) { return r.stage || null; },
+    stageBadge(r) {
+      if (!r || r.review_status !== "pending" || !r.stage) return "";
+      return `第 ${r.review_level}/${r.total_levels} 级 · ${r.stage.name}`;
+    },
+    stageRoleLabel(role) {
+      return role === "moderator" ? "复核级" : "初审级";
+    },
+    fmtDue(stage) {
+      if (!stage || !stage.due_at) return "";
+      const d = new Date(stage.due_at * 1000);
+      const p = n => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+    },
+    reviewerNames(r) {
+      const s = this.stageOf(r);
+      return s && s.reviewers && s.reviewers.length ? s.reviewers.join("、") : "";
+    },
+    // 按当前级选择默认审核令牌：复核级/超时兜底用复核员令牌；初审级用审核令牌（可空）
+    tokenFor(r) {
+      const s = this.stageOf(r);
+      if (s && (s.role === "moderator" || s.overdue)) return this.moderatorToken;
+      return this.reviewerToken || null;
     },
     async switchArchive(status) {
       this.archiveStatus = status;
@@ -211,11 +319,13 @@ window.ChallengeSelect = {
     },
     async review(rec, action) {
       try {
-        await API.reviewSubmission(rec.record_id, action, rec._note || "");
+        await API.reviewSubmission(
+          rec.record_id, action, rec._note || "", rec.review_level,
+          this.tokenFor(rec));
         await this.loadReviewTab("queue");
         this.$emit("refresh");
       } catch (e) {
-        this.actionErr = "初审失败：" + e.message;
+        this.actionErr = "审核失败：" + e.message;
       }
     },
     async decide(ap, decision) {
@@ -318,6 +428,8 @@ window.ChallengeSelect = {
         <p class="brief">{{ c.brief || '（设计者没有留下简介）' }}</p>
         <div class="best-meta">
           设计 {{ c.author }} · 预算 {{ kmps(c.budget_dv) }} km/s · {{ c.milestone_count }} 个里程碑
+          <span class="ver-tag" v-if="c.review_pipeline && !c.review_pipeline.legacy">
+            {{ c.review_pipeline.levels }} 级审核</span>
           <span v-if="c.pending_count" class="pending-tag">待审 {{ c.pending_count }}</span>
         </div>
         <div class="best-meta" v-if="c.best_current">
@@ -430,6 +542,50 @@ window.ChallengeSelect = {
           + 添加里程碑
         </button>
 
+        <h3 class="form-h3">审核链
+          <label class="pipeline-toggle">
+            <input type="checkbox" :checked="form.pipelineEnabled"
+                   @change="onPipelineToggle($event.target.checked)">
+            自定义多级审核（按版本指定审核人与时限）
+          </label>
+        </h3>
+        <p class="form-sub" v-if="!form.pipelineEnabled">
+          {{ form.mode === "version"
+             ? "未改动时新版本沿用上一版本审核链；勾选后可指定 1~5 个审核级。"
+             : "默认单级（初审员一审，申诉进复核队列）；勾选后可指定 1~5 个审核级。" }}
+        </p>
+        <div v-if="form.pipelineEnabled" class="pipeline-list">
+          <div v-for="(st, i) in form.stages" :key="i" class="stage-row">
+            <div class="stage-head">
+              <b>第 {{ i + 1 }} 级</b>
+              <select v-model="st.role" @change="onStageRole(st)">
+                <option value="reviewer">初审级（reviewer）</option>
+                <option value="moderator">复核级（moderator）</option>
+              </select>
+              <input v-model.trim="st.name" maxlength="24" class="stage-name"
+                     :placeholder="i === 0 ? '初审' : ('第 ' + (i + 1) + ' 级')">
+              <button class="icon-btn danger" @click="removeStage(i)"
+                      :disabled="form.stages.length <= 1">✕</button>
+            </div>
+            <div class="stage-body">
+              <label class="stage-field">指定审核人（不选=该角色均可处理）
+                <select v-model="st.reviewers" multiple size="3" class="stage-select">
+                  <option v-for="rv in reviewerOptions(st)" :key="rv.name"
+                          :value="rv.name">
+                    {{ rv.name }}（{{ rv.role === "moderator" ? "复核员" : "初审员" }}）
+                  </option>
+                </select>
+              </label>
+              <label class="stage-field">处理时限（小时，留空=不限）
+                <input type="number" v-model.number="st.hours" min="0.5" max="720"
+                       step="0.5" class="num">
+              </label>
+            </div>
+          </div>
+          <button class="btn chip" @click="addStage"
+                  :disabled="form.stages.length >= 5">+ 添加审核级（最多 5 级）</button>
+        </div>
+
         <p v-if="publishErr" class="form-err">⚠ {{ publishErr }}</p>
         <div class="form-btns">
           <button class="btn ghost" @click="mode = 'list'">取消</button>
@@ -459,41 +615,75 @@ window.ChallengeSelect = {
         </div>
         <p v-if="actionErr" class="form-err">⚠ {{ actionErr }}</p>
 
-        <!-- 初审队列（含申诉重审条目，标红提示走复核裁决） -->
+        <!-- 审核队列：按版本审核链逐级处理（含路由回该级的申诉重审） -->
         <template v-if="reviewTab === 'queue'">
+          <div class="queue-toolbar">
+            <label class="mod-token">审核令牌
+              <input v-model.trim="reviewerToken"
+                     @change="Store.set('reviewerToken', reviewerToken)"
+                     placeholder="留空=内置初审员（复核级请在下方用复核员令牌）">
+            </label>
+            <label class="mod-token">
+              <input type="checkbox" v-model="queueOverdueOnly"> 仅看超时
+            </label>
+            <div class="status-switch">
+              <button :class="{ active: !queueLevel }" @click="queueLevel=null; loadReviewTab('queue')">全部级</button>
+              <button v-for="lv in 5" :key="lv"
+                      :class="{ active: queueLevel === lv }"
+                      @click="queueLevel=lv; loadReviewTab('queue')">{{ lv }} 级</button>
+            </div>
+          </div>
           <p v-if="queueLoading" class="plan-empty">加载中…</p>
           <p v-else-if="!queue.length" class="plan-empty">没有待审核的飞行记录。</p>
           <div v-for="r in queue" :key="r.record_id" class="queue-row"
-               :class="{ 'appeal-row': r.appeal_open }">
+               :class="{ 'appeal-row': r.appeal_open, 'overdue-row': r.stage && r.stage.overdue }">
             <div class="queue-main">
               <b>#{{ r.challenge_id }} {{ r.challenge_title }}</b>
               <span class="ver-tag">v{{ r.version }}</span>
-              <span v-if="r.appeal_open" class="appeal-tag">第 {{ r.appeal_round }} 轮申诉复核中</span>
+              <span v-if="r.stage" class="stage-tag">
+                {{ stageBadge(r) }} · {{ stageRoleLabel(r.stage.role) }}
+                <template v-if="reviewerNames(r)"> · {{ reviewerNames(r) }}</template>
+              </span>
+              <span v-if="r.stage && r.stage.overdue" class="overdue-tag">
+                ⏰ 已超时（应于 {{ fmtDue(r.stage) }} 前处理）</span>
+              <span v-else-if="r.stage && r.stage.due_at" class="due-tag">
+                时限至 {{ fmtDue(r.stage) }}</span>
+              <span v-if="r.appeal_open && r.appeal_routed" class="appeal-tag">
+                第 {{ r.appeal_round }} 轮申诉·回到本级重审</span>
+              <span v-else-if="r.appeal_open" class="appeal-tag">
+                第 {{ r.appeal_round }} 轮申诉（复核队列处理）</span>
               <div class="queue-meta">
                 {{ r.player }} · ★{{ r.stars }} · {{ kmps(r.fuel_used) }} km/s
                 · {{ Math.round(r.elapsed_days) }} 天 · {{ fmtDate(r.created_at) }}
               </div>
-              <div v-if="r.appeal_open" class="queue-meta appeal-reason">
-                申诉理由：{{ r.appeal_reason }}（请在「申诉复核」页裁决，初审不可直接终审）
+              <div v-if="r.appeal_open && r.appeal_routed" class="queue-meta appeal-reason">
+                申诉理由：{{ r.appeal_reason }}（「通过」=推翻原判并继续流转；「驳回」=维持原判）
               </div>
             </div>
             <input class="queue-note" v-model.trim="r._note" maxlength="200"
-                   placeholder="审核备注（可选）" :disabled="!!r.appeal_open">
-            <button class="btn mini approve" :disabled="!!r.appeal_open"
-                    @click="review(r, 'approve')">✓ 通过</button>
-            <button class="btn mini reject" :disabled="!!r.appeal_open"
-                    @click="review(r, 'reject')">✕ 驳回</button>
+                   :placeholder="(r.stage && r.stage.final_level) ? '终审备注（可选）' : '本级备注（可选）'">
+            <button class="btn mini approve"
+                    @click="review(r, 'approve')">
+              {{ r.stage && r.stage.final_level ? '✓ 终审通过'
+                 : (r.appeal_open && r.appeal_routed ? '↺ 推翻·继续' : '↓ 通过本级') }}</button>
+            <button class="btn mini reject"
+                    @click="review(r, 'reject')">
+              {{ r.appeal_open && r.appeal_routed ? '⊘ 维持原判' : '✕ 驳回' }}</button>
             <button class="btn mini ghost" @click="showTimeline(r.record_id)">链路</button>
           </div>
         </template>
 
-        <!-- 申诉复核（仅复核员） -->
+        <!-- 申诉复核（仅复核员；未配置多级审核链的默认链路申诉） -->
         <template v-if="reviewTab === 'appeals'">
           <label class="mod-token">复核员令牌
             <input v-model.trim="moderatorToken"
                    @change="Store.set('modToken', moderatorToken)"
                    placeholder="local-moderator（本地单机默认）">
           </label>
+          <p class="form-sub">
+            配置了多级审核链的版本，玩家申诉会回到做出原判的那一级审核队列（见「初审队列」）；
+            这里只受理默认单级链路的申诉。
+          </p>
           <p v-if="queueLoading" class="plan-empty">加载中…</p>
           <p v-else-if="!appeals.length" class="plan-empty">没有待复核的申诉。</p>
           <div v-for="a in appeals" :key="a.appeal_id" class="queue-row appeal-row">
@@ -578,7 +768,14 @@ window.ChallengeSelect = {
               <span :class="'status-tag ' + statusClass(r.review_status)">
                 {{ statusLabel(r.review_status) }}</span>
               <span v-if="r.appeal_open" class="appeal-tag">
-                第 {{ r.appeal_rounds }} 轮申诉复核中</span>
+                第 {{ r.appeal_rounds }} 轮申诉复核中
+                <template v-if="r.appeal_target_level">
+                  · 第 {{ r.appeal_target_level }} 级重审</template>
+              </span>
+              <span v-else-if="r.review_status === 'pending' && r.stage" class="stage-tag">
+                审核中 {{ r.review_level }}/{{ r.total_levels }} 级 · {{ r.stage.name }}
+                <span v-if="r.stage.overdue" class="overdue-tag">已超时</span>
+              </span>
               <div class="queue-meta">
                 ★{{ r.stars }} · {{ kmps(r.fuel_used) }} km/s
                 · {{ Math.round(r.elapsed_days) }} 天 · {{ fmtDate(r.created_at) }}

@@ -899,17 +899,44 @@ def test_legacy_reviewed_submissions_backfill_events():
     rec.reviewed_by = None
     db.commit()
     db.close()
-    # 模拟旧库删除 reviewed_by 列（SQLite 需要重建表）
+    # 模拟旧库删除 reviewed_by 列（SQLite 需要重建表）。
+    # CREATE TABLE AS SELECT 会丢失主键/类型/约束，导致后续用例插入的行没有
+    # 自增主键；这里显式按旧库列声明重建（生产迁移本身不走 CTAS）。
     conn = sqlite3.connect(DB_PATH)
     cols = [r[1] for r in conn.execute("PRAGMA table_info(challenge_submission)")]
     if "reviewed_by" in cols:
         keep = [c for c in cols if c != "reviewed_by"]
         keep_sql = ", ".join(keep)
+        info = {r[1]: (r[2], r[3], r[4])
+                for r in conn.execute("PRAGMA table_info(challenge_submission)").fetchall()}
+        col_defs = []
+        for c in keep:
+            if c == "id":
+                continue
+            typ, notnull, dflt = info[c]
+            col_sql = f"{c} {typ or ''}".rstrip()
+            if notnull:
+                col_sql += " NOT NULL"
+            if dflt is not None:
+                col_sql += f" DEFAULT {dflt}"
+            col_defs.append(col_sql)
         conn.execute("PRAGMA foreign_keys=off")
         conn.execute("ALTER TABLE challenge_submission RENAME TO _cs_old")
         conn.execute(
-            "CREATE TABLE challenge_submission AS SELECT "
-            f"{keep_sql} FROM _cs_old")
+            "CREATE TABLE challenge_submission ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            + ", ".join(col_defs)
+            + ", FOREIGN KEY(run_id) REFERENCES challenge_run (id), "
+            "UNIQUE(challenge_id, submission_id))")
+        conn.execute(
+            f"INSERT INTO challenge_submission ({keep_sql}) "
+            f"SELECT {keep_sql} FROM _cs_old")
+        conn.execute("CREATE INDEX ix_challengesubmission_challenge_id "
+                     "ON challenge_submission (challenge_id)")
+        conn.execute("CREATE INDEX ix_challengesubmission_run_id "
+                     "ON challenge_submission (run_id)")
+        conn.execute("CREATE INDEX ix_challengesubmission_review_status "
+                     "ON challenge_submission (review_status)")
         conn.execute("DROP TABLE _cs_old")
         conn.execute("PRAGMA foreign_keys=on")
         conn.commit()

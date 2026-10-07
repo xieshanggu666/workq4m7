@@ -27,14 +27,24 @@ class UnlockRuleIn(BaseModel):
     value: Optional[int] = None
 
 
+class ReviewStageIn(BaseModel):
+    """一个审核级：级别名 + 角色 + 指定审核人白名单 + 时限（小时，null=不限）。"""
+    name: str = ""
+    role: str = "reviewer"     # reviewer / moderator
+    reviewers: List[str] = Field(default_factory=list)
+    time_limit_hours: Optional[float] = None
+
+
 class DefinitionIn(BaseModel):
-    """一版关卡定义：燃料预算 + 时间限制 + 里程碑。"""
+    """一版关卡定义：燃料预算 + 时间限制 + 里程碑 + 多级审核链。"""
     name: str = ""
     brief: str = ""
     hint: str = ""
     budget_dv: float
     t_max: float
     milestones: List[MilestoneIn] = Field(default_factory=list)
+    # 缺省（未提供）= 新建按默认单级 / 发新版沿用上版；显式 null 或 [] = 回到默认单级
+    review_pipeline: Optional[List[ReviewStageIn]] = None
 
 
 class CreateChallengeIn(DefinitionIn):
@@ -99,7 +109,18 @@ def _dump(model) -> dict:
 def _definition(req: DefinitionIn) -> dict:
     d = _dump(req)
     d["milestones"] = [_dump(m) for m in req.milestones]
+    d.pop("review_pipeline", None)
     return d
+
+
+def _pipeline_arg(req: DefinitionIn):
+    """审核链入参归一：字段未出现 → UNSET（沿默认/沿用上版）；出现（含 null）→ 列表/None。"""
+    fields_set = getattr(req, "model_fields_set", None) or getattr(req, "__fields_set__", set())
+    if "review_pipeline" not in fields_set:
+        return ch_svc._PIPELINE_UNSET
+    if req.review_pipeline is None:
+        return None
+    return [_dump(s) for s in req.review_pipeline]
 
 
 def _sim_dict(r: dict, challenge_id: int, version: int) -> dict:
@@ -131,6 +152,8 @@ def _error(e: Exception) -> HTTPException:
         return HTTPException(401, str(e))
     if isinstance(e, ch_svc.ForbiddenReviewer):
         return HTTPException(403, str(e))
+    if isinstance(e, ch_svc.StageForbidden):
+        return HTTPException(403, str(e))
     if isinstance(e, ch_svc.ChallengeLocked):
         return HTTPException(403, str(e))
     if isinstance(e, (ch_svc.ReviewConflict, ch_svc.AppealConflict)):
@@ -151,22 +174,29 @@ def list_challenges():
 
 @router.post("", status_code=201)
 def create_challenge(req: CreateChallengeIn):
-    """发布新挑战：校验定义后创建挑战主体与不可变的 v1 版本。"""
+    """发布新挑战：校验定义（含多级审核链）后创建挑战主体与不可变的 v1 版本。"""
     try:
         with SessionLocal() as db:
             return ch_svc.create_challenge(
                 db, title=req.title, author=req.author,
                 definition=_definition(req),
-                unlock_rule=_dump(req.unlock_rule) if req.unlock_rule else None)
+                unlock_rule=_dump(req.unlock_rule) if req.unlock_rule else None,
+                review_pipeline=_pipeline_arg(req))
     except (ch_svc.ValidationError,) as e:
         raise _error(e)
 
 
 @router.get("/review_queue")
-def review_queue(status: str = "pending", limit: int = 100):
-    """全站成绩提交队列（默认待审核），供审核工作流使用。"""
+def review_queue(status: str = "pending", limit: int = 100,
+                 level: Optional[int] = None, overdue: Optional[bool] = None):
+    """全站成绩提交队列（默认待审核）。
+
+    可按审核级 ?level=1..n 与该级 SLA 是否超时 ?overdue=true 过滤；
+    每条返回当前级 stage（级别名/指定审核人/时限 due_at/overdue）。
+    """
     with SessionLocal() as db:
-        return {"submissions": ch_svc.list_submissions(db, status=status, limit=limit)}
+        return {"submissions": ch_svc.list_submissions(
+            db, status=status, limit=limit, level=level, overdue=overdue)}
 
 
 @router.get("/submissions/{record_id}")
@@ -203,10 +233,16 @@ def appeal_submission(record_id: int, req: AppealIn):
 
 
 @router.get("/appeals")
-def appeals(status: str = "pending", limit: int = 50):
-    """申诉队列（默认待复核），供复核员工作流使用。"""
+def appeals(status: str = "pending", limit: int = 50,
+            level: Optional[int] = None):
+    """申诉队列。
+
+    不带 ?level=：仅返回旧版默认链路、由复核员统一裁决的申诉；
+    ?level=N：返回路由到第 N 级审核队列的多级链路申诉（由该级审核人处理）。
+    """
     with SessionLocal() as db:
-        return {"appeals": ch_svc.list_appeals(db, status=status, limit=limit)}
+        return {"appeals": ch_svc.list_appeals(
+            db, status=status, limit=limit, level=level)}
 
 
 @router.get("/mine/submissions")
@@ -272,6 +308,13 @@ def reviewer_me(x_reviewer_token: Optional[str] = Header(default=None)):
         raise _error(e)
 
 
+@router.get("/reviewers")
+def list_reviewers():
+    """审核账号名单（id/署名/角色，不含令牌）：配置审核级指定审核人白名单用。"""
+    with SessionLocal() as db:
+        return {"reviewers": ch_svc.list_reviewers(db)}
+
+
 @router.post("/reviewers", status_code=201)
 def create_reviewer(req: ReviewerIn,
                     x_reviewer_token: Optional[str] = Header(default=None)):
@@ -289,16 +332,23 @@ def create_reviewer(req: ReviewerIn,
 
 @router.post("/submissions/{record_id}/review")
 def review_submission(record_id: int, req: ReviewIn,
-                      x_reviewer_token: Optional[str] = Header(default=None)):
-    """初审成绩：通过后进入排行榜、开放回放并联动解锁；驳回则排除。"""
+                      x_reviewer_token: Optional[str] = Header(default=None),
+                      level: Optional[int] = None):
+    """在当前审核级裁决：逐级通过直至终审上榜，或在某级驳回（按版本审核链鉴权）。
+
+    ?level=N 为队列重试防串级参数：成绩当前不在第 N 级时返回 409。
+    申诉路由到某级的成绩也在本接口由该级指定审核人处理（维持/推翻）。
+    """
     try:
         with SessionLocal() as db:
             return ch_svc.review(db, record_id=record_id,
                                  action=req.action, note=req.note or "",
-                                 reviewer_token=_token(x_reviewer_token))
+                                 reviewer_token=_token(x_reviewer_token),
+                                 expect_level=level)
     except (ch_svc.ValidationError, ch_svc.SubmissionNotFound,
             ch_svc.ReviewConflict, ch_svc.UnauthorizedReviewer,
-            ch_svc.ForbiddenReviewer) as e:
+            ch_svc.ForbiddenReviewer, ch_svc.StageForbidden,
+            ch_svc.VersionNotFound) as e:
         raise _error(e)
 
 
@@ -314,12 +364,18 @@ def challenge_detail(challenge_id: int):
 
 @router.post("/{challenge_id}/versions", status_code=201)
 def publish_version(challenge_id: int, req: VersionIn):
-    """发布新版本：定义落库为不可变版本并设为当前版本（旧版本保留）。"""
+    """发布新版本：定义（含审核链）落库为不可变版本并设为当前版本（旧版本保留）。
+
+    审核链缺省沿用上一版本；显式 null/[] 回到默认单级；显式列表则按新配置。
+    """
     try:
         with SessionLocal() as db:
             kwargs = {}
             if req.unlock_rule is not None:
                 kwargs["unlock_rule"] = _dump(req.unlock_rule)
+            pipeline = _pipeline_arg(req)
+            if pipeline is not ch_svc._PIPELINE_UNSET:
+                kwargs["review_pipeline"] = pipeline
             return ch_svc.publish_version(db, challenge_id,
                                           definition=_definition(req), **kwargs)
     except (ch_svc.ValidationError, ch_svc.ChallengeNotFound) as e:

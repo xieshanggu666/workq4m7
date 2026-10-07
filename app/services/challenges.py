@@ -1,21 +1,30 @@
-"""社区航线挑战服务：版本化发布 / 幂等提交 / 审核 / 申诉与复核 / 排行榜 / 回放 / 解锁联动。
+"""社区航线挑战服务：版本化发布 / 幂等提交 / 多级审核 / 申诉与复核 / 排行榜 / 回放 / 解锁联动。
 
 设计要点：
-- 版本化：每次发布生成不可变的 ChallengeVersion（预算 + 里程碑 + 时间限制），
+- 版本化：每次发布生成不可变的 ChallengeVersion（预算 + 里程碑 + 时间限制 + 审核链），
   飞行记录与成绩都锚定具体版本；排行榜按版本结算，旧版本仍可查看与回放。
+- 多级审核（按版本配置）：设计者在发布版本时配置 1~MAX_REVIEW_STAGES 个审核级，
+  每级指定级别名、角色（reviewer/moderator）、指定审核人署名白名单与时限（SLA）。
+  提交进入第 1 级 pending 队列；逐级通过（review_advance）后进入下一级，
+  全部级通过才终审 approved 并联动排行榜/回放/解锁；任一级驳回即 rejected。
+  版本未配置审核链时沿用旧版默认单级（初审员一审，申诉统一进复核员队列）。
+- 申诉进入正确队列：对被第 L 级驳回的成绩申诉，成绩回到第 L 级 pending 队列
+  （ChallengeAppeal.target_level=L），由该级指定审核人在普通审核接口裁决——
+  维持原判回到原状态、推翻原判则继续向 L+1 级流转（终审级推翻即上榜）；
+  撤销（终审后）成绩的申诉回到终审级。旧版默认链路 target_level 为空，
+  仍由复核员在复核裁决接口处理。
+- 时限（SLA）：每级可配 time_limit_hours；队列返回应处理时间 due_at 与 overdue
+  标记。超时不自动改判，moderator 可在任意级兜底处理（含超时队列）。
 - 幂等结算：/run 落库执行档案（ChallengeRun），/submit 以 submission_id 为幂等键
   关联档案落库成绩；重复提交（双击/重试/多标签页）返回首个结果，不重复计数。
-- 审核联动：成绩默认 pending；审核通过（approved）后才进入排行榜、开放轨迹回放，
-  并计入解锁条件。解锁状态按规则实时求值，审核通过即自动联动，无需额外迁移。
-- 申诉与复核：玩家可对 rejected/revoked 成绩凭 appeal_id 幂等键发起申诉（每成绩
-  至多 2 轮、同时仅 1 条），成绩回到 pending 进入复核队列；复核员（moderator）
-  维持原判(uphold→回到原状态)或推翻原判(overturn→approved)。复核员还可撤销
-  (revoke)/恢复(restore)已上榜成绩；排行榜/回放/解锁全部按状态实时求值，
+- 审核联动：只有终审 approved 的成绩才进入排行榜、开放轨迹回放，并计入解锁条件。
+  解锁状态按规则实时求值；撤销(revoke)/恢复(restore)由复核员执行，
   撤销即自动出榜、关闭回放并级联回收解锁，接口返回前后 diff 的回滚效果。
-- 可追溯：每次状态迁移追加一条不可变的 ChallengeReviewEvent（提交/初审/申诉/
-  复核/撤销/恢复）；历史已审核成绩在启动时补登 legacy 事件，链路不断档。
-- 审核权限：Reviewer 分 reviewer（初审）/moderator（复核、撤销、注册）两级，
-  token 经 X-Reviewer-Token 上送；内置本地账号开箱即用，缺省调用降级为内置初审员。
+- 可追溯：每次状态迁移追加一条不可变的 ChallengeReviewEvent（提交/逐级通过/
+  终审通过/驳回/申诉/复核/撤销/恢复）；历史已审核成绩在启动时补登 legacy 事件。
+- 审核权限：Reviewer 分 reviewer（初审）/moderator（复核、撤销、注册、超时兜底）；
+  各级再以署名白名单限定到指定审核人；token 经 X-Reviewer-Token 上送；
+  内置本地账号开箱即用，旧版默认单级缺省调用降级为内置初审员。
 - 并发安全：模块级锁串行化提交/审核/申诉临界区（SQLite 单写者），唯一约束兜底。
 """
 from __future__ import annotations
@@ -52,6 +61,7 @@ APPEAL_PENDING, APPEAL_UPHOLD, APPEAL_OVERTURN = "pending", "uphold", "overturn"
 # 事件类型
 EV_SUBMIT = "submit"
 EV_REVIEW = {"approved": "review_approve", "rejected": "review_reject"}
+EV_ADVANCE = "review_advance"  # 多级链路：通过当前级，进入下一级（非终审）
 EV_APPEAL = "appeal"
 EV_APPEAL_DECISION = {APPEAL_UPHOLD: "appeal_uphold", APPEAL_OVERTURN: "appeal_overturn"}
 EV_REVOKE = "revoke"
@@ -62,6 +72,11 @@ ROLE_REVIEWER = "reviewer"
 ROLE_MODERATOR = "moderator"
 MAX_APPEAL_ROUNDS = 2
 MAX_APPEAL_REASON = 500
+
+# 多级审核链配置
+MAX_REVIEW_STAGES = 5
+MAX_STAGE_REVIEWERS = 10
+MIN_STAGE_HOURS, MAX_STAGE_HOURS = 0.5, 720.0  # 每级时限（小时）
 
 # 内置审核账号（本地单机开箱即用；正式部署可禁用/改 token）
 BUILTIN_REVIEWERS = [
@@ -122,6 +137,10 @@ class AppealConflict(RuntimeError):
 
 class ReviewerConflict(ValueError):
     """审核员署名或 token 冲突。"""
+
+
+class StageForbidden(PermissionError):
+    """审核人不属于该版本该审核级的指定名单（403）。"""
 
 
 # ---------- 定义校验 ----------
@@ -217,46 +236,211 @@ def validate_unlock_rule(db, rule, self_id: Optional[int] = None) -> Optional[di
     raise ValidationError(f"未知解锁条件类型: {t}")
 
 
+# ---------- 多级审核链配置 ----------
+
+def _legacy_pipeline() -> List[dict]:
+    """旧版默认单级链路：初审员一审、无时限、申诉统一进复核员队列。"""
+    return [{"level": 1, "name": "初审", "role": ROLE_REVIEWER,
+             "reviewers": [], "time_limit_hours": None, "legacy": True}]
+
+
+def validate_review_pipeline(db, pipeline, *, current_levels: Optional[List[str]] = None) -> List[dict]:
+    """校验并规范化版本的多级审核链配置。
+
+    入参：[{"name": 级别名, "role": reviewer/moderator,
+            "reviewers": [审核员署名…], "time_limit_hours": 数字或 null}]
+    返回存储形态：[{"level", "name", "role", "reviewers"(排序去重),
+                 "time_limit_hours", "legacy"=False}]
+    None/[] 表示沿用旧版默认单级（current_levels 仅用于错误提示）。
+    指定审核人须是已注册且启用的账号；角色为 moderator 的级别只允许指定复核员，
+    reviewer 级别不限制被指定人的角色（moderator 本就有权处理任意级）。
+    """
+    if pipeline is None:
+        return _legacy_pipeline()
+    if not isinstance(pipeline, list):
+        raise ValidationError("审核链必须是审核级列表")
+    if not 1 <= len(pipeline) <= MAX_REVIEW_STAGES:
+        raise ValidationError(f"审核级数量需在 1~{MAX_REVIEW_STAGES} 之间")
+    where = ("配置" if not current_levels
+             else f"（当前共 {len(current_levels)} 级）")
+    active = {r.name: r for r in db.query(Reviewer).filter(Reviewer.active == 1).all()}
+    out, names = [], set()
+    for i, st in enumerate(pipeline, 1):
+        if not isinstance(st, dict):
+            raise ValidationError(f"第 {i} 级审核配置格式有误{where}")
+        name = _clean_text(st.get("name"), 24, f"第 {i} 级级别名",
+                           allow_empty=True) or f"第 {i} 级"
+        role = st.get("role") or ROLE_REVIEWER
+        if role not in (ROLE_REVIEWER, ROLE_MODERATOR):
+            raise ValidationError(f"第 {i} 级角色未知: {role}{where}")
+        raw_reviewers = st.get("reviewers") or []
+        if not isinstance(raw_reviewers, list):
+            raise ValidationError(f"第 {i} 级指定审核人必须是列表{where}")
+        if len(raw_reviewers) > MAX_STAGE_REVIEWERS:
+            raise ValidationError(f"第 {i} 级指定审核人不超过 {MAX_STAGE_REVIEWERS} 人")
+        reviewers = []
+        for who in raw_reviewers:
+            who = _clean_text(who, 24, f"第 {i} 级审核人署名", allow_empty=True)
+            if not who or who in reviewers:
+                continue
+            rv = active.get(who)
+            if rv is None:
+                raise ValidationError(f"第 {i} 级指定审核人不存在或已停用: {who}")
+            if role == ROLE_MODERATOR and rv.role != ROLE_MODERATOR:
+                raise ValidationError(
+                    f"第 {i} 级是复核级，指定审核人「{who}」不是复核员")
+            reviewers.append(who)
+        tlim = st.get("time_limit_hours")
+        if tlim is not None and tlim != "":
+            tlim = _bounded(tlim, MIN_STAGE_HOURS, MAX_STAGE_HOURS,
+                            f"第 {i} 级时限（小时）")
+        else:
+            tlim = None
+        if name in names:
+            raise ValidationError(f"审核级别名重复: {name}")
+        names.add(name)
+        out.append({"level": i, "name": name, "role": role,
+                    "reviewers": reviewers,
+                    "time_limit_hours": (round(float(tlim), 2)
+                                         if tlim is not None else None),
+                    "legacy": False})
+    return out
+
+
+def pipeline_of(ver: Optional[ChallengeVersion]) -> List[dict]:
+    """取版本的审核链；未配置（旧版本）返回旧版默认单级。"""
+    raw = (ver.review_pipeline_json if ver is not None
+           and ver.review_pipeline_json else "")
+    if not raw:
+        return _legacy_pipeline()
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return _legacy_pipeline()
+    return data if isinstance(data, list) and data else _legacy_pipeline()
+
+
+def _stage_at(pipeline: List[dict], level: Optional[int]) -> dict:
+    """审核级配置（1 起）；旧存档空级别归一到第 1 级；越界归终审级。"""
+    idx = (level or 1) - 1
+    if not 0 <= idx < len(pipeline):
+        idx = len(pipeline) - 1
+    return pipeline[idx]
+
+
+def _current_level(rec: ChallengeSubmission) -> int:
+    """成绩当前所处审核级：pending 记录取 review_level（旧存档归一到 1）。"""
+    return max(1, rec.review_level or 1)
+
+
+def _stage_view(stage: dict, entered_at: Optional[float], now: float) -> dict:
+    """对外的审核级视图（含 SLA 应处理时间与超时标记）。"""
+    limit = stage.get("time_limit_hours")
+    due_at = (entered_at + limit * 3600.0
+              if limit and entered_at else None)
+    return {
+        "level": stage["level"], "name": stage["name"], "role": stage["role"],
+        "reviewers": list(stage.get("reviewers") or []),
+        "time_limit_hours": limit,
+        "due_at": due_at,
+        "overdue": bool(due_at and now > due_at),
+        "legacy": bool(stage.get("legacy")),
+    }
+
+
+def _stage_decision_view(db, rec: ChallengeSubmission, pipeline: List[dict]) -> dict:
+    """一条待审成绩在当前级的视图：当前级 + 总级数 + 是否终审级 + SLA。"""
+    level = _current_level(rec)
+    stage = _stage_at(pipeline, level)
+    view = _stage_view(stage, rec.review_stage_entered_at, time.time())
+    view["total_levels"] = len(pipeline)
+    view["final_level"] = level >= len(pipeline)
+    return view
+
+
+def _authorize_stage(db, pipeline: List[dict], level: int,
+                     rv: Reviewer) -> dict:
+    """校验审核人有权处理该版本的指定审核级，返回该级配置。
+
+    - moderator 可处理任意级（含超时兜底）；
+    - reviewer 仅能处理 role=reviewer 的级，且级别指定了署名白名单时必须在名单内；
+    - 复核级（role=moderator）初审员无权处理。
+    """
+    stage = _stage_at(pipeline, level)
+    if rv.role == ROLE_MODERATOR:
+        return stage
+    if stage["role"] == ROLE_MODERATOR:
+        raise ForbiddenReviewer(
+            f"第 {level} 级「{stage['name']}」是复核级，初审员无权处理")
+    allowed = stage.get("reviewers") or []
+    if allowed and rv.name not in allowed:
+        raise StageForbidden(
+            f"第 {level} 级「{stage['name']}」仅由指定审核人处理，"
+            f"「{rv.name}」不在名单内")
+    return stage
+
+
 # ---------- 发布（版本化） ----------
 
-def _add_version(db, challenge_id: int, version: int, defn: dict) -> ChallengeVersion:
+def _add_version(db, challenge_id: int, version: int, defn: dict,
+                 pipeline: Optional[List[dict]] = None) -> ChallengeVersion:
+    # 旧版默认单级链路以空串落库（兼容旧版本/旧读取路径）；仅显式配置才存 JSON
+    is_legacy = not pipeline or (len(pipeline) == 1 and pipeline[0].get("legacy"))
     ver = ChallengeVersion(
         challenge_id=challenge_id, version=version,
         name=defn["name"], brief=defn["brief"], hint=defn["hint"],
         budget_dv=defn["budget_dv"], t_max=defn["t_max"],
         milestones_json=json.dumps(defn["milestones"], ensure_ascii=False),
+        review_pipeline_json="" if is_legacy else json.dumps(
+            pipeline, ensure_ascii=False),
         created_at=time.time(),
     )
     db.add(ver)
     return ver
 
 
+_PIPELINE_UNSET = object()  # publish_version 的"审核链未提供"哨兵（区别于显式 None=默认单级）
+
+
 def create_challenge(db, *, title: str, author: str, definition: dict,
-                     unlock_rule=None) -> dict:
-    """发布新挑战：创建挑战主体 + 不可变的 v1 版本。"""
+                     unlock_rule=None,
+                     review_pipeline=_PIPELINE_UNSET) -> dict:
+    """发布新挑战：创建挑战主体 + 不可变的 v1 版本（含审核链配置）。"""
     title = _clean_text(title, 40, "挑战标题")
     author = _clean_text(author, 24, "设计者署名", allow_empty=True) or "匿名设计者"
     defn = validate_definition(definition)
     rule = validate_unlock_rule(db, unlock_rule)
+    pipeline = (validate_review_pipeline(db, review_pipeline)
+                if review_pipeline is not _PIPELINE_UNSET else _legacy_pipeline())
     ch = Challenge(title=title, author=author, status="published", current_version=1,
                    unlock_rule_json=json.dumps(rule) if rule else "",
                    created_at=time.time())
     db.add(ch)
     db.flush()  # 取 challenge.id
-    _add_version(db, ch.id, 1, defn)
+    _add_version(db, ch.id, 1, defn, pipeline)
     db.commit()
     return challenge_detail(db, ch.id)
 
 
 def publish_version(db, challenge_id: int, definition: dict,
-                    unlock_rule=_KEEP_RULE) -> dict:
+                    unlock_rule=_KEEP_RULE,
+                    review_pipeline=_PIPELINE_UNSET) -> dict:
     """发布新版本：定义校验后落库为不可变版本并设为当前版本。
 
     unlock_rule 缺省（未传）时保留原解锁条件；显式传 {"type":"none"} 可清除。
+    review_pipeline 缺省时沿用上一版本的审核链；显式传 None/[] 表示回到
+    旧版默认单级；显式传审核级列表则按新配置（成绩按提交时版本的链路审核）。
     """
     ch = _get_challenge(db, challenge_id)
     defn = validate_definition(definition)
-    _add_version(db, ch.id, ch.current_version + 1, defn)
+    prev = _get_version(db, challenge_id, ch.current_version)
+    if review_pipeline is _PIPELINE_UNSET:
+        pipeline = pipeline_of(prev)
+    else:
+        pipeline = validate_review_pipeline(
+            db, review_pipeline,
+            current_levels=[s.get("name", "") for s in pipeline_of(prev)])
+    _add_version(db, ch.id, ch.current_version + 1, defn, pipeline)
     ch.current_version += 1
     if unlock_rule is not _KEEP_RULE:
         rule = validate_unlock_rule(db, unlock_rule, self_id=ch.id)
@@ -437,6 +621,8 @@ def list_challenges(db) -> List[dict]:
             "budget_dv": v.budget_dv if v else 0.0,
             "t_max": v.t_max if v else 0.0,
             "milestone_count": len(json.loads(v.milestones_json)) if v else 0,
+            "review_pipeline": _pipeline_summary(pipeline_of(v)) if v
+            else _pipeline_summary(_legacy_pipeline()),
             "unlocked": unlocked, "unlock_desc": desc,
             "best": best.get(ch.id),
             "best_current": best_current.get(ch.id),
@@ -465,20 +651,33 @@ def challenge_detail(db, challenge_id: int) -> dict:
             "version": v.version, "name": v.name,
             "budget_dv": v.budget_dv, "t_max": v.t_max,
             "milestone_count": len(json.loads(v.milestones_json)),
+            "review_pipeline": _pipeline_summary(pipeline_of(v)),
             "created_at": v.created_at,
         } for v in vers],
         "current": {
             "version": cur.version, "name": cur.name, "brief": cur.brief,
             "hint": cur.hint, "budget_dv": cur.budget_dv, "t_max": cur.t_max,
             "milestones": json.loads(cur.milestones_json),
+            "review_pipeline": _pipeline_summary(pipeline_of(cur)),
         },
         "best": _best_approved(db).get(ch.id),
         "best_current": _best_current_approved(db).get(ch.id),
     }
 
 
+def _pipeline_summary(pipeline: List[dict]) -> dict:
+    """审核链摘要：级数 + 各级名/角色/时限（列表卡片与版本列表用）。"""
+    return {"levels": len(pipeline),
+            "legacy": bool(pipeline and pipeline[0].get("legacy")),
+            "stages": [{"level": s["level"], "name": s["name"],
+                        "role": s["role"],
+                        "reviewers": list(s.get("reviewers") or []),
+                        "time_limit_hours": s.get("time_limit_hours")}
+                       for s in pipeline]}
+
+
 def version_detail(db, challenge_id: int, version: int) -> dict:
-    """指定版本的完整定义（查看旧版本 / 按旧版本游玩）。"""
+    """指定版本的完整定义（含审核链；查看旧版本 / 按旧版本游玩）。"""
     ch = _get_challenge(db, challenge_id)
     ver = _get_version(db, challenge_id, version)
     return {
@@ -486,6 +685,7 @@ def version_detail(db, challenge_id: int, version: int) -> dict:
         "version": ver.version, "name": ver.name, "brief": ver.brief,
         "hint": ver.hint, "budget_dv": ver.budget_dv, "t_max": ver.t_max,
         "milestones": json.loads(ver.milestones_json),
+        "review_pipeline": _pipeline_summary(pipeline_of(ver)),
         "is_current": ver.version == ch.current_version,
         "created_at": ver.created_at,
     }
@@ -535,6 +735,8 @@ def _submitted_response(rec: ChallengeSubmission, duplicated: bool) -> dict:
         "challenge_id": rec.challenge_id,
         "version": rec.version,
         "review_status": rec.review_status,
+        "review_level": _current_level(rec) if rec.review_status == PENDING
+        else rec.review_level,
         "stars": rec.stars,
     }
 
@@ -568,6 +770,7 @@ def submit(db, *, challenge_id: int, run_id: str, submission_id: Optional[str],
             raise RunChallengeMismatch("执行记录与挑战不匹配")
 
         # 3) 落库成绩记录（(challenge_id, submission_id) 唯一约束兜底并发重复）
+        now = time.time()
         rec = ChallengeSubmission(
             submission_id=submission_id or uuid.uuid4().hex,
             run_id=run.id,
@@ -578,7 +781,9 @@ def submit(db, *, challenge_id: int, run_id: str, submission_id: Optional[str],
             fuel_used=run.fuel_used,
             elapsed_days=run.elapsed_days,
             review_status="pending",
-            created_at=time.time(),
+            review_level=1,                 # 从第 1 级审核队列开始逐级流转
+            review_stage_entered_at=now,
+            created_at=now,
         )
         db.add(rec)
         try:
@@ -596,7 +801,8 @@ def submit(db, *, challenge_id: int, run_id: str, submission_id: Optional[str],
                    actor_role="player",
                    detail={"submission_id": rec.submission_id,
                            "challenge_id": rec.challenge_id, "version": rec.version,
-                           "stars": rec.stars, "fuel_used": rec.fuel_used})
+                           "stars": rec.stars, "fuel_used": rec.fuel_used,
+                           "level": 1})
         db.commit()
         return _submitted_response(rec, duplicated=False)
 
@@ -688,6 +894,8 @@ def _sqlite_migrate(db) -> None:
     """对旧库做增量迁移（SQLite ALTER/表重建，全程幂等）。
 
     - challenge_submission 补 reviewed_by 列（历史库兼容）；
+    - 多级审核：challenge_submission 补 review_level / review_stage_entered_at；
+      challenge_version 补 review_pipeline_json；challenge_appeal 补 target_level；
     - 幂等键唯一约束由全局 (submission_id) 收窄为作用域复合唯一：
       challenge_submission(challenge_id, submission_id)、
       score_record(level_id, submission_id)，避免不同挑战/关卡复用同一键串成绩。
@@ -714,9 +922,31 @@ def _sqlite_migrate(db) -> None:
                 conn.execute(
                     "ALTER TABLE challenge_submission ADD COLUMN reviewed_by VARCHAR(24)")
                 conn.commit()
+            if cols and "review_level" not in cols:
+                conn.execute(
+                    "ALTER TABLE challenge_submission ADD COLUMN review_level INTEGER")
+                conn.execute(
+                    "ALTER TABLE challenge_submission "
+                    "ADD COLUMN review_stage_entered_at FLOAT")
+                conn.commit()
             changed |= _rebuild_scoped_unique(
                 conn, "challenge_submission", "challenge_id",
                 "uq_chsub_challenge_submission")
+        if "challenge_version" in tables:
+            cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(challenge_version)").fetchall()}
+            if cols and "review_pipeline_json" not in cols:
+                conn.execute(
+                    "ALTER TABLE challenge_version "
+                    "ADD COLUMN review_pipeline_json TEXT NOT NULL DEFAULT ''")
+                conn.commit()
+        if "challenge_appeal" in tables:
+            cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(challenge_appeal)").fetchall()}
+            if cols and "target_level" not in cols:
+                conn.execute(
+                    "ALTER TABLE challenge_appeal ADD COLUMN target_level INTEGER")
+                conn.commit()
         if "score_record" in tables:
             changed |= _rebuild_scoped_unique(
                 conn, "score_record", "level_id",
@@ -834,6 +1064,17 @@ def register_reviewer(db, *, token: str, name: str, role: str,
     return {"id": rv.id, "name": rv.name, "role": rv.role}
 
 
+def list_reviewers(db, *, active_only: bool = True) -> List[dict]:
+    """审核账号名单（不含 token）：供设计者在审核级白名单中挑选指定审核人。"""
+    bootstrap(db)
+    q = db.query(Reviewer)
+    if active_only:
+        q = q.filter(Reviewer.active == 1)
+    rows = q.order_by(Reviewer.role, Reviewer.id).all()
+    return [{"id": r.id, "name": r.name, "role": r.role,
+             "active": r.active, "created_at": r.created_at} for r in rows]
+
+
 # ---------- 事件档案 ----------
 
 def _add_event(db, rec, *, kind: str, actor: str = "",
@@ -902,15 +1143,36 @@ def _effects(db, before: dict, rec: ChallengeSubmission, *,
     }
 
 
-# ---------- 审核 ----------
+# ---------- 审核（多级链路） ----------
+
+def _pipeline_for_rec(db, rec: ChallengeSubmission) -> Tuple[ChallengeVersion, List[dict]]:
+    """取成绩提交版本及其审核链（成绩锚定提交时版本，链路随之不可变）。"""
+    ver = _get_version(db, rec.challenge_id, rec.version)
+    return ver, pipeline_of(ver)
+
+
+def _close_appeal(appeal: ChallengeAppeal, *, decision: str, note: str,
+                  rv: Reviewer, now: float) -> None:
+    appeal.status = decision
+    appeal.decision_note = note
+    appeal.decided_by = rv.name
+    appeal.decided_at = now
+
 
 def review(db, *, record_id: int, action: str, note: str = "",
-           reviewer_token: Optional[str] = None) -> dict:
-    """初审状态机：pending → approved / rejected（需要初审员权限）。
+           reviewer_token: Optional[str] = None,
+           expect_level: Optional[int] = None) -> dict:
+    """处理成绩在当前审核级队列中的裁决（多级审核状态机）。
 
-    申诉重审中的 pending 成绩不能在此直接终审（请走复核裁决接口）。
-    幂等：重复同一终审动作返回当前状态（duplicated=True）；
-    已终审的成绩再作相反动作 → ReviewConflict(409)。
+    提交进入第 1 级 pending；通过且后面还有级别 → 进入下一级（review_advance，
+    仍不上榜）；终审级通过 → approved（上榜/回放/解锁）；任一级驳回 → rejected。
+    权限按提交版本该级配置校验：复核级仅 moderator；初审级的署名白名单非空时
+    审核人须在名单内；moderator 可处理任意级（超时兜底）。
+    申诉重审：被第 L 级驳回/撤销而发起的申诉回到第 L 级队列（appeal.target_level=L），
+    在本接口裁决——维持(uphold 效果=驳回维持)、推翻(overturn 效果=通过并继续流转)；
+    旧版默认链路（target_level 为空）仍须复核员走复核裁决接口。
+    幂等：终审后重复同一终审动作 duplicated=True；相反动作 → ReviewConflict(409)。
+    expect_level 供队列重试防串级：非当前级时 409。
     """
     if action not in _REVIEW_ACTIONS:
         raise ValidationError(f"未知审核动作: {action}")
@@ -922,38 +1184,122 @@ def review(db, *, record_id: int, action: str, note: str = "",
                  .first())
         if rec is None:
             raise SubmissionNotFound(f"成绩记录不存在: {record_id}")
+        ver, pipeline = _pipeline_for_rec(db, rec)
+        level = _current_level(rec)
+        stage = _authorize_stage(db, pipeline, level, rv)
+        open_appeal = _open_appeal(db, rec.id)
         before = _snapshot_effects(db)
         replay_before = rec.review_status == APPROVED
-        open_appeal = _open_appeal(db, rec.id)
-        if rec.review_status == target:
-            return _review_response(rec, target, duplicated=True,
-                                    actor=rv.name, effects=_effects(
-                                        db, before, rec, replayable_before=replay_before))
+        clean_note = (note or "").strip()[:200]
+        now = time.time()
+
+        # 已终审：幂等 / 冲突
         if rec.review_status != PENDING:
+            if rec.review_status == target:
+                return _review_response(
+                    rec, stage, pipeline, target, duplicated=True, actor=rv.name,
+                    advanced=False, effects=_effects(
+                        db, before, rec, replayable_before=replay_before))
             raise ReviewConflict(
                 f"成绩已审核（{rec.review_status}），不能重复审核")
-        if open_appeal is not None:
+
+        # 旧版默认链路的申诉统一由复核员裁决接口处理，不进多级队列
+        if open_appeal is not None and open_appeal.target_level is None:
             raise ReviewConflict(
-                "成绩正在申诉复核中，请通过复核裁决（uphold/overturn）处理")
-        rec.review_status = target
-        rec.review_note = (note or "").strip()[:200]
+                "成绩正在申诉复核中，请由复核员通过复核裁决（uphold/overturn）处理")
+        if expect_level is not None and expect_level != level:
+            raise ReviewConflict(
+                f"该成绩当前在第 {level} 级队列（请求第 {expect_level} 级），请刷新队列")
+
+        is_final = level >= len(pipeline)
+        if target == REJECTED:
+            # 维持驳回（含申诉维持原判）：成绩终止于 rejected，停留在驳回级
+            rec.review_status = REJECTED
+            rec.review_stage_entered_at = None
+            rec.review_note = clean_note
+            rec.reviewed_by = rv.name
+            rec.reviewed_at = now
+            if open_appeal is not None:
+                _close_appeal(open_appeal, decision=APPEAL_UPHOLD,
+                              note=clean_note, rv=rv, now=now)
+                _add_event(db, rec, kind=EV_APPEAL_DECISION[APPEAL_UPHOLD],
+                           actor=rv.name, actor_role=rv.role, appeal=open_appeal,
+                           detail={"round": open_appeal.round,
+                                   "from_status": open_appeal.from_status,
+                                   "level": level, "stage": stage["name"],
+                                   "note": clean_note})
+            _add_event(db, rec, kind=EV_REVIEW[REJECTED], actor=rv.name,
+                       actor_role=rv.role, appeal=open_appeal,
+                       detail={"level": level, "stage": stage["name"],
+                               "note": clean_note})
+            db.commit()
+            return _review_response(
+                rec, stage, pipeline, REJECTED, duplicated=False, actor=rv.name,
+                advanced=False, appeal=open_appeal,
+                effects=_effects(db, before, rec, replayable_before=replay_before))
+
+        # target == approved：先落“通过当前级”的申诉裁决（若有）
+        if open_appeal is not None:
+            _close_appeal(open_appeal, decision=APPEAL_OVERTURN,
+                          note=clean_note, rv=rv, now=now)
+            _add_event(db, rec, kind=EV_APPEAL_DECISION[APPEAL_OVERTURN],
+                       actor=rv.name, actor_role=rv.role, appeal=open_appeal,
+                       detail={"round": open_appeal.round,
+                               "from_status": open_appeal.from_status,
+                               "level": level, "stage": stage["name"],
+                               "note": clean_note})
+        rec.review_note = clean_note
+        if not is_final:
+            # 逐级通过：进入下一级队列（不上榜/不回放/不解锁）
+            next_stage = pipeline[level]  # 0 基下标：当前 level 的下一项
+            rec.review_level = level + 1
+            rec.review_stage_entered_at = now
+            _add_event(db, rec, kind=EV_ADVANCE, actor=rv.name,
+                       actor_role=rv.role, appeal=open_appeal,
+                       detail={"from_level": level, "from_stage": stage["name"],
+                               "to_level": level + 1,
+                               "to_stage": next_stage["name"],
+                               "note": clean_note})
+            db.commit()
+            return _review_response(
+                rec, next_stage, pipeline, PENDING, duplicated=False,
+                actor=rv.name, advanced=True, appeal=open_appeal,
+                effects=_effects(db, before, rec, replayable_before=replay_before))
+
+        # 终审级通过：approved，联动排行榜/回放/解锁
+        rec.review_status = APPROVED
+        rec.review_level = level
+        rec.review_stage_entered_at = None
         rec.reviewed_by = rv.name
-        rec.reviewed_at = time.time()
-        _add_event(db, rec, kind=EV_REVIEW[target], actor=rv.name,
-                   actor_role=ROLE_REVIEWER,
-                   detail={"note": rec.review_note})
+        rec.reviewed_at = now
+        _add_event(db, rec, kind=EV_REVIEW[APPROVED], actor=rv.name,
+                   actor_role=rv.role, appeal=open_appeal,
+                   detail={"level": level, "stage": stage["name"],
+                           "total_levels": len(pipeline), "note": clean_note})
         db.commit()
-        return _review_response(rec, target, duplicated=False,
-                                actor=rv.name,
-                                effects=_effects(db, before, rec,
-                                                 replayable_before=replay_before))
+        return _review_response(
+            rec, stage, pipeline, APPROVED, duplicated=False, actor=rv.name,
+            advanced=False, appeal=open_appeal,
+            effects=_effects(db, before, rec, replayable_before=replay_before))
 
 
-def _review_response(rec, status, *, duplicated: bool, actor: str,
-                     effects: Optional[dict] = None) -> dict:
+def _review_response(rec, stage, pipeline, status, *, duplicated: bool, actor: str,
+                     advanced: bool, effects: Optional[dict] = None,
+                     appeal=None) -> dict:
+    stage_view = _stage_view(stage,
+                             rec.review_stage_entered_at
+                             if status == PENDING else None,
+                             time.time())
+    cur_level = _current_level(rec) if status == PENDING else rec.review_level
+    stage_view["final_level"] = cur_level >= len(pipeline)
     return {"record_id": rec.id, "challenge_id": rec.challenge_id,
             "version": rec.version, "review_status": status,
             "reviewed_by": actor, "duplicated": duplicated,
+            "advanced": advanced,
+            "review_level": cur_level,
+            "total_levels": len(pipeline),
+            "stage": stage_view,
+            "appeal_round": appeal.round if appeal is not None else None,
             "effects": effects}
 
 
@@ -980,8 +1326,9 @@ def revoke(db, *, record_id: int, note: str = "",
                 f"只有已通过的成绩可以撤销（当前 {rec.review_status}）")
         if _open_appeal(db, rec.id) is not None:
             raise ReviewConflict("成绩正在申诉复核中，不能撤销")
+        _, pipeline = _pipeline_for_rec(db, rec)
         _reject_terminal(db, rec, status=REVOKED, note=note, reviewer=rv,
-                         kind=EV_REVOKE)
+                         kind=EV_REVOKE, pipeline=pipeline)
         db.commit()
         return _moderation_response(rec, EV_REVOKE, duplicated=False,
                                     actor=rv.name,
@@ -1008,13 +1355,19 @@ def restore(db, *, record_id: int, note: str = "",
         if rec.review_status != REVOKED:
             raise ReviewConflict(
                 f"只有已撤销的成绩可以恢复（当前 {rec.review_status}）")
+        _, pipeline = _pipeline_for_rec(db, rec)
+        final_level = len(pipeline)
         rec.review_status = APPROVED
+        rec.review_level = final_level
+        rec.review_stage_entered_at = None
         rec.review_note = (note or "").strip()[:200]
         rec.reviewed_by = rv.name
         rec.reviewed_at = time.time()
+        stage = _stage_at(pipeline, final_level)
         _add_event(db, rec, kind=EV_RESTORE, actor=rv.name,
                    actor_role=ROLE_MODERATOR,
-                   detail={"note": rec.review_note})
+                   detail={"note": rec.review_note, "level": final_level,
+                           "stage": stage["name"]})
         db.commit()
         return _moderation_response(rec, EV_RESTORE, duplicated=False,
                                     actor=rv.name,
@@ -1032,13 +1385,20 @@ def _moderation_response(rec, action_kind, *, duplicated: bool, actor: str,
 
 
 def _reject_terminal(db, rec, *, status: str, note: str, reviewer: Reviewer,
-                     kind: str) -> None:
+                     kind: str, pipeline: Optional[List[dict]] = None) -> None:
+    """撤销上榜成绩：终止于 revoked，停留在终审级（其申诉将路由回终审级）。"""
     rec.review_status = status
     rec.review_note = (note or "").strip()[:200]
     rec.reviewed_by = reviewer.name
     rec.reviewed_at = time.time()
+    detail = {"note": rec.review_note}
+    if pipeline is not None:
+        rec.review_level = len(pipeline)
+        rec.review_stage_entered_at = None
+        stage = _stage_at(pipeline, len(pipeline))
+        detail.update(level=len(pipeline), stage=stage["name"])
     _add_event(db, rec, kind=kind, actor=reviewer.name,
-               actor_role=ROLE_MODERATOR, detail={"note": rec.review_note})
+               actor_role=ROLE_MODERATOR, detail=detail)
 
 
 def _get_submission(db, record_id: int) -> ChallengeSubmission:
@@ -1065,7 +1425,11 @@ def create_appeal(db, *, record_id: int, player: str, reason: str,
 
     约束：署名须与提交者一致（仅本人可申诉）；仅 rejected/revoked 可申诉；
     每条成绩最多 MAX_APPEAL_ROUNDS 轮，同时仅一条待裁决申诉。
-    受理后成绩回到 pending（标注申诉轮次）进入复核队列，等待复核员裁决。
+    受理后成绩回到 pending 进入“正确的队列”：
+    - 提交版本配置了多级审核链：回到做出驳回/撤销的那一级（rejected 停留在
+      驳回级 review_level；revoked 是终审后撤销，回到终审级），由该级指定
+      审核人在普通审核接口裁决（appeal.target_level = 级别）；
+    - 旧版默认单级链路：target_level 为空，统一进复核员队列走复核裁决接口。
     """
     player = (player or "").strip()[:24] or DEFAULT_PLAYER
     reason = (reason or "").strip()
@@ -1088,18 +1452,30 @@ def create_appeal(db, *, record_id: int, player: str, reason: str,
             raise AppealConflict(
                 f"当前状态（{rec.review_status}）不能申诉，仅驳回/撤销的成绩可申诉")
         if _open_appeal(db, rec.id) is not None:
-            raise AppealConflict("该成绩已有进行中的申诉，请等待复核裁决")
+            raise AppealConflict("该成绩已有进行中的申诉，请等待裁决")
         rounds = (db.query(ChallengeAppeal)
                     .filter(ChallengeAppeal.submission_id == rec.id)
                     .count())
         if rounds >= MAX_APPEAL_ROUNDS:
             raise AppealConflict(f"每条成绩最多申诉 {MAX_APPEAL_ROUNDS} 次")
+        # 路由到正确队列：未配置审核链的旧版本（legacy）走复核员队列；
+        # 配置过的多级链路回到原判级别——驳回停留级 / 撤销回到终审级。
+        ver, pipeline = _pipeline_for_rec(db, rec)
+        legacy = bool(pipeline[0].get("legacy"))
+        if legacy:
+            target_level = None
+        elif rec.review_status == REVOKED:
+            target_level = len(pipeline)
+        else:
+            target_level = _current_level(rec)
+        now = time.time()
         appeal = ChallengeAppeal(
             appeal_uid=appeal_id or uuid.uuid4().hex,
             submission_id=rec.id, round=rounds + 1,
             from_status=rec.review_status, player=player,
+            target_level=target_level,
             reason=reason, status=APPEAL_PENDING,
-            created_at=time.time())
+            created_at=now)
         db.add(appeal)
         try:
             db.flush()
@@ -1109,11 +1485,18 @@ def create_appeal(db, *, record_id: int, player: str, reason: str,
                      .filter(ChallengeAppeal.appeal_uid == appeal.appeal_uid)
                      .first())
             return _appeal_response(dup, duplicated=True)
-        # 成绩回到待复核队列；排行榜/回放/解锁因状态变化自动回滚
+        # 成绩回到对应审核级待审队列；排行榜/回放/解锁因状态变化自动回滚
         rec.review_status = PENDING
+        if target_level is not None:
+            rec.review_level = target_level
+            rec.review_stage_entered_at = now
+        stage = _stage_at(pipeline, target_level)
         _add_event(db, rec, kind=EV_APPEAL, actor=player, actor_role="player",
                    detail={"round": appeal.round,
                            "from_status": appeal.from_status,
+                           "target_level": target_level,
+                           "target_stage": stage["name"]
+                               if target_level is not None else None,
                            "reason": reason}, appeal=appeal)
         db.commit()
         return _appeal_response(appeal, duplicated=False)
@@ -1121,9 +1504,11 @@ def create_appeal(db, *, record_id: int, player: str, reason: str,
 
 def decide_appeal(db, *, appeal_id_key: int, decision: str, note: str = "",
                   moderator_token: Optional[str] = None) -> dict:
-    """复核员裁决申诉：uphold=维持原判（成绩回到 from_status）；
+    """复核员裁决申诉（旧版默认单级链路）：uphold=维持原判（成绩回到 from_status）；
     overturn=推翻原判（改判通过 approved，重新上榜/回放/解锁）。
 
+    多级审核链版本的申诉已路由到对应审核级队列（appeal.target_level 非空），
+    须由该级指定审核人在普通审核接口处理，此处返回 ReviewConflict(409)。
     幂等：对已裁决申诉重复同一裁决返回 duplicated=True；
     相反裁决 → ReviewConflict(409)。
     """
@@ -1137,6 +1522,12 @@ def decide_appeal(db, *, appeal_id_key: int, decision: str, note: str = "",
         if appeal is None:
             raise AppealNotFound(f"申诉记录不存在: {appeal_id_key}")
         rec = _get_submission(db, appeal.submission_id)
+        if appeal.target_level is not None:
+            _, pipeline = _pipeline_for_rec(db, rec)
+            stage = _stage_at(pipeline, appeal.target_level)
+            raise ReviewConflict(
+                f"该申诉已路由到第 {appeal.target_level} 级「{stage['name']}」"
+                "审核队列，请由该级审核人在审核队列中处理")
         before = _snapshot_effects(db)
         replay_before = rec.review_status == APPROVED
         if appeal.status != APPEAL_PENDING:
@@ -1175,7 +1566,9 @@ def _appeal_response(ap: ChallengeAppeal, *, duplicated: bool) -> dict:
             "appeal_id": ap.id, "appeal_uid": ap.appeal_uid,
             "record_id": ap.submission_id, "round": ap.round,
             "from_status": ap.from_status, "status": ap.status,
-            "review_status": PENDING}
+            "target_level": ap.target_level,
+            "review_status": PENDING,
+            "review_level": ap.target_level or 1}
 
 
 def _appeal_decision_response(ap, rec, decision, *, duplicated: bool,
@@ -1189,21 +1582,34 @@ def _appeal_decision_response(ap, rec, decision, *, duplicated: bool,
 
 
 def list_appeals(db, *, status: str = APPEAL_PENDING,
-                 limit: int = 50) -> List[dict]:
-    """申诉队列：默认待复核（moderator 工作流）。"""
+                 level: Optional[int] = None, limit: int = 50) -> List[dict]:
+    """申诉队列：默认待裁决。
+
+    level=None：仅返回旧版默认链路、由复核员统一裁决的申诉（复核员工作流）；
+    level>=1：返回路由到该审核级队列的多级链路申诉（由该级审核人处理）。
+    """
     q = db.query(ChallengeAppeal)
     if status in (APPEAL_PENDING, APPEAL_UPHOLD, APPEAL_OVERTURN):
         q = q.filter(ChallengeAppeal.status == status)
+    if level is None:
+        q = q.filter(ChallengeAppeal.target_level.is_(None))
+    else:
+        q = q.filter(ChallengeAppeal.target_level == level)
     rows = (q.order_by(ChallengeAppeal.id.desc())
              .limit(max(1, min(200, limit))).all())
     sub_ids = {a.submission_id for a in rows}
     subs = {s.id: s for s in
             (db.query(ChallengeSubmission)
                .filter(ChallengeSubmission.id.in_(sub_ids)).all())} if sub_ids else {}
+    versions = {(v.challenge_id, v.version): v
+                for v in db.query(ChallengeVersion).all()}
     titles = {c.id: c.title for c in db.query(Challenge).all()}
     out = []
     for a in rows:
         s = subs.get(a.submission_id)
+        ver = versions.get((s.challenge_id, s.version)) if s else None
+        pipeline = pipeline_of(ver) if ver else _legacy_pipeline()
+        stage = _stage_at(pipeline, a.target_level or 1)
         out.append({
             "appeal_id": a.id, "record_id": a.submission_id,
             "challenge_id": s.challenge_id if s else None,
@@ -1212,6 +1618,9 @@ def list_appeals(db, *, status: str = APPEAL_PENDING,
             "version": s.version if s else None,
             "player": a.player, "round": a.round,
             "from_status": a.from_status, "status": a.status,
+            "target_level": a.target_level,
+            "target_stage": stage["name"] if a.target_level else None,
+            "stage_role": stage["role"] if a.target_level else ROLE_MODERATOR,
             "reason": a.reason, "decision_note": a.decision_note,
             "decided_by": a.decided_by,
             "stars": s.stars if s else None,
@@ -1235,11 +1644,17 @@ def player_submissions(db, player: str, *, challenge_id: Optional[int] = None,
     rows = (q.order_by(ChallengeSubmission.id.desc())
              .limit(max(1, min(200, limit))).all())
     titles = {c.id: c.title for c in db.query(Challenge).all()}
+    versions = {(v.challenge_id, v.version): v
+                for v in db.query(ChallengeVersion).all()}
     out = []
     for r in rows:
         ap = _open_appeal(db, r.id)
         rounds = (db.query(ChallengeAppeal)
                     .filter(ChallengeAppeal.submission_id == r.id).count())
+        ver = versions.get((r.challenge_id, r.version))
+        pipeline = pipeline_of(ver) if ver else _legacy_pipeline()
+        stage = _stage_decision_view(db, r, pipeline) if r.review_status == PENDING \
+            else None
         out.append({
             "record_id": r.id, "challenge_id": r.challenge_id,
             "challenge_title": titles.get(r.challenge_id, f"#{r.challenge_id}"),
@@ -1247,8 +1662,12 @@ def player_submissions(db, player: str, *, challenge_id: Optional[int] = None,
             "fuel_used": r.fuel_used, "elapsed_days": r.elapsed_days,
             "review_status": r.review_status, "review_note": r.review_note,
             "reviewed_by": r.reviewed_by,
+            "review_level": _current_level(r),
+            "total_levels": len(pipeline),
+            "stage": stage,
             "appeal_rounds": rounds,
             "appeal_open": ap.id if ap else None,
+            "appeal_target_level": ap.target_level if ap else None,
             "appeal_available": (
                 r.review_status in (REJECTED, REVOKED)
                 and ap is None and rounds < MAX_APPEAL_ROUNDS),
@@ -1268,6 +1687,11 @@ def submission_timeline(db, record_id: int) -> Optional[dict]:
     if rec is None:
         return None
     ch = db.query(Challenge).filter(Challenge.id == rec.challenge_id).first()
+    ver = (db.query(ChallengeVersion)
+             .filter(ChallengeVersion.challenge_id == rec.challenge_id,
+                     ChallengeVersion.version == rec.version)
+             .first())
+    pipeline = pipeline_of(ver) if ver else _legacy_pipeline()
     events = (db.query(ChallengeReviewEvent)
                 .filter(ChallengeReviewEvent.submission_id == rec.id)
                 .order_by(ChallengeReviewEvent.id)
@@ -1283,6 +1707,8 @@ def submission_timeline(db, record_id: int) -> Optional[dict]:
         "version": rec.version, "player": rec.player,
         "stars": rec.stars, "fuel_used": rec.fuel_used,
         "elapsed_days": rec.elapsed_days,
+        "review_pipeline": _pipeline_summary(pipeline),
+        "review_level": _current_level(rec),
         "review_status": rec.review_status, "review_note": rec.review_note,
         "reviewed_by": rec.reviewed_by,
         "appeal_rounds": len(appeals),
@@ -1301,6 +1727,9 @@ def submission_timeline(db, record_id: int) -> Optional[dict]:
         } for i, e in enumerate(events)],
         "appeals": [{
             "appeal_id": a.id, "round": a.round, "from_status": a.from_status,
+            "target_level": a.target_level,
+            "target_stage": (_stage_at(pipeline, a.target_level)["name"]
+                             if a.target_level else None),
             "reason": a.reason, "status": a.status,
             "decision_note": a.decision_note, "decided_by": a.decided_by,
             "created_at": a.created_at, "decided_at": a.decided_at,
@@ -1309,22 +1738,42 @@ def submission_timeline(db, record_id: int) -> Optional[dict]:
 
 
 def list_submissions(db, *, challenge_id: Optional[int] = None,
-                     status: str = "pending", limit: int = 50) -> List[dict]:
-    """成绩提交列表：默认待审核队列（含申诉重审，附 appeal 标记），可按挑战过滤。"""
+                     status: str = "pending", limit: int = 50,
+                     level: Optional[int] = None,
+                     overdue: Optional[bool] = None) -> List[dict]:
+    """成绩提交列表：默认待审核队列（含申诉重审，附 appeal 标记），可按挑战/级过滤。
+
+    pending 状态下可按 level（当前所处审核级，旧版归一为第 1 级）与
+    overdue（该级 SLA 是否超时）过滤，供各级审核人查看自己的队列。
+    """
     q = db.query(ChallengeSubmission)
     if challenge_id is not None:
         q = q.filter(ChallengeSubmission.challenge_id == challenge_id)
     if status in ("pending", "approved", "rejected", "revoked"):
         q = q.filter(ChallengeSubmission.review_status == status)
+    if status == "pending" and level is not None:
+        q = q.filter(
+            # 旧存档空级别归一到第 1 级
+            (ChallengeSubmission.review_level == level)
+            | ((ChallengeSubmission.review_level.is_(None)) & (level == 1)))
     rows = (q.order_by(ChallengeSubmission.id.desc())
-             .limit(max(1, min(200, limit)))
+             .limit(max(1, min(500, limit)))
              .all())
     titles = {c.id: c.title for c in db.query(Challenge).all()}
+    versions = {(v.challenge_id, v.version): v
+                for v in db.query(ChallengeVersion).all()}
     result = []
     for r in rows:
         ap = _open_appeal(db, r.id)
         rounds = (db.query(ChallengeAppeal)
                     .filter(ChallengeAppeal.submission_id == r.id).count())
+        ver = versions.get((r.challenge_id, r.version))
+        pipeline = pipeline_of(ver) if ver else _legacy_pipeline()
+        cur_level = _current_level(r)
+        stage = (_stage_decision_view(db, r, pipeline)
+                 if r.review_status == PENDING else None)
+        if overdue is not None and (stage is None or stage["overdue"] != overdue):
+            continue
         result.append({
             "record_id": r.id,
             "challenge_id": r.challenge_id,
@@ -1337,13 +1786,19 @@ def list_submissions(db, *, challenge_id: Optional[int] = None,
             "review_status": r.review_status,
             "review_note": r.review_note,
             "reviewed_by": r.reviewed_by,
+            "review_level": cur_level,
+            "total_levels": len(pipeline),
+            "stage": stage,
             "appeal_open": ap.id if ap else None,
             "appeal_round": ap.round if ap else None,
+            "appeal_target_level": ap.target_level if ap else None,
+            "appeal_routed": bool(ap and ap.target_level is not None),
+            "appeal_legacy": bool(ap and ap.target_level is None),
             "appeal_reason": ap.reason if ap else None,
             "appeal_rounds_total": rounds,
             "created_at": r.created_at,
         })
-    return result
+    return result[:max(1, min(200, limit))]
 
 
 # ---------- 排行榜与回放 ----------
@@ -1403,6 +1858,11 @@ def submission_detail(db, record_id: int) -> Optional[dict]:
     open_ap = _open_appeal(db, rec.id)
     rounds = (db.query(ChallengeAppeal)
                 .filter(ChallengeAppeal.submission_id == rec.id).count())
+    ver = (db.query(ChallengeVersion)
+             .filter(ChallengeVersion.challenge_id == rec.challenge_id,
+                     ChallengeVersion.version == rec.version)
+             .first())
+    pipeline = pipeline_of(ver) if ver else _legacy_pipeline()
     detail = {
         "record_id": rec.id,
         "challenge_id": rec.challenge_id,
@@ -1414,8 +1874,14 @@ def submission_detail(db, record_id: int) -> Optional[dict]:
         "review_status": rec.review_status,
         "review_note": rec.review_note,
         "reviewed_by": rec.reviewed_by,
+        "review_level": _current_level(rec),
+        "total_levels": len(pipeline),
+        "stage": (_stage_decision_view(db, rec, pipeline)
+                  if rec.review_status == PENDING else None),
+        "review_pipeline": _pipeline_summary(pipeline),
         "appeal_rounds": rounds,
         "appeal_open": open_ap.id if open_ap else None,
+        "appeal_target_level": open_ap.target_level if open_ap else None,
         "appeal_available": (
             rec.review_status in (REJECTED, REVOKED)
             and open_ap is None and rounds < MAX_APPEAL_ROUNDS),
