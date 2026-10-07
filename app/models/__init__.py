@@ -97,6 +97,8 @@ class ChallengeVersion(Base):
     budget_dv = Column(Float, nullable=False)
     t_max = Column(Float, nullable=False)
     milestones_json = Column(Text, nullable=False, default="[]")
+    # 空串 = 默认审核流（单级初审 + 复核员受理申诉）；否则为不可变的多级审核配置
+    review_flow_json = Column(Text, nullable=False, default="")
     created_at = Column(Float, nullable=False, default=time.time)
 
 
@@ -150,10 +152,17 @@ class ChallengeSubmission(Base):
     fuel_used = Column(Float, nullable=False, default=0.0)
     elapsed_days = Column(Float, nullable=False, default=0.0)
     review_status = Column(String(16), nullable=False, default="pending", index=True)
-    # pending=待审(含申诉重审) approved=已通过(上榜/回放/解锁) rejected=已驳回 revoked=已撤销上榜
+    # pending=待审(多级流程中由 review_stage 指明当前级；含申诉重审)
+    # approved=已通过全部级(上榜/回放/解锁) rejected=某级驳回 revoked=已撤销上榜
     review_note = Column(String(200), nullable=False, default="")
-    reviewed_by = Column(String(24), nullable=True)  # 终审审核员署名（旧存档为空=历史审核）
+    reviewed_by = Column(String(24), nullable=True)  # 最近一级审核员署名（旧存档为空=历史审核）
     reviewed_at = Column(Float, nullable=True)
+    # 多级审核流：当前等待的审核级（0 起；approved/rejected/revoked 后停留在终态级）
+    review_stage = Column(Integer, nullable=True)
+    # 各级处理结果（[{stage,name,action,actor,note,created_at}]，只追加）
+    review_stages_json = Column(Text, nullable=False, default="[]")
+    # 进入当前审核级的时间（SLA 时限起算；申诉回到驳回级时重置）
+    stage_entered_at = Column(Float, nullable=True)
     created_at = Column(Float, nullable=False, default=time.time)
 
 
@@ -193,6 +202,8 @@ class ChallengeAppeal(Base):
     reason = Column(String(500), nullable=False, default="")
     # pending=待复核 approved=复核推翻原判(改判通过) rejected=复核维持原判
     status = Column(String(16), nullable=False, default="pending", index=True)
+    # moderator=复核员裁决（默认）；stage=回到驳回时的审核级，由该级审核人裁决
+    route = Column(String(16), nullable=False, default="moderator")
     decision_note = Column(String(200), nullable=False, default="")
     decided_by = Column(String(24), nullable=True)
     created_at = Column(Float, nullable=False, default=time.time)

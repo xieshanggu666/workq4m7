@@ -78,11 +78,24 @@ const API = {
     const q = version ? `?version=${version}` : "";
     return this._req(`/api/challenges/${cid}/leaderboard${q}`);
   },
-  reviewQueue() { return this._req("/api/challenges/review_queue"); },
-  reviewSubmission(recordId, action, note) {
+  reviewQueue(stage, token) {
+    let q = "";
+    if (stage !== undefined && stage !== null && stage !== "") q += `?stage=${stage}`;
+    return this._reqWithToken(`/api/challenges/review_queue${q}`, token);
+  },
+  _reqWithToken(url, token) {
+    const headers = {};
+    if (token) headers["X-Reviewer-Token"] = token;
+    return this._req(url, Object.keys(headers).length
+      ? { headers } : undefined);
+  },
+  reviewSubmission(recordId, action, note, token, stage) {
+    const headers = { "Content-Type": "application/json" };
+    if (token) headers["X-Reviewer-Token"] = token;
+    const body = { action, note: note || "" };
+    if (stage !== undefined && stage !== null) body.stage = stage;
     return this._req(`/api/challenges/submissions/${recordId}/review`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action, note: note || "" }),
+      method: "POST", headers, body: JSON.stringify(body),
     });
   },
   challengeSubmission(recordId) {
@@ -95,8 +108,10 @@ const API = {
   reviewQueueStatus(status) {
     return this._req(`/api/challenges/review_queue?status=${status}`);
   },
-  appealsQueue(status = "pending") {
-    return this._req(`/api/challenges/appeals?status=${status}`);
+  appealsQueue(status = "pending", route) {
+    let url = `/api/challenges/appeals?status=${status}`;
+    if (route) url += `&route=${route}`;
+    return this._req(url);
   },
   appealSubmission(recordId, player, reason, appealId) {
     return this._req(`/api/challenges/submissions/${recordId}/appeal`, {

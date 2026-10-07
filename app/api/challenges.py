@@ -27,6 +27,20 @@ class UnlockRuleIn(BaseModel):
     value: Optional[int] = None
 
 
+class ReviewStageIn(BaseModel):
+    """一个审核级：名称 + 所需角色 + 指定审核人署名（可空=角色全员）+ 时限（小时）。"""
+    name: str
+    role: str = "reviewer"      # reviewer / moderator
+    reviewers: List[str] = Field(default_factory=list)
+    sla_hours: Optional[float] = None
+
+
+class ReviewFlowIn(BaseModel):
+    """按版本配置的多级审核流；不传则创建用默认流、发版沿用当前版本。"""
+    stages: Optional[List[ReviewStageIn]] = None
+    appeal_route: str = "moderator"  # moderator=复核员裁决 / stage=回到驳回级重审
+
+
 class DefinitionIn(BaseModel):
     """一版关卡定义：燃料预算 + 时间限制 + 里程碑。"""
     name: str = ""
@@ -41,10 +55,12 @@ class CreateChallengeIn(DefinitionIn):
     title: str
     author: str = ""
     unlock_rule: Optional[UnlockRuleIn] = None
+    review_flow: Optional[ReviewFlowIn] = None
 
 
 class VersionIn(DefinitionIn):
     unlock_rule: Optional[UnlockRuleIn] = None  # 缺省保留原条件；{"type":"none"} 清除
+    review_flow: Optional[ReviewFlowIn] = None  # 缺省沿用当前版本审核流
 
 
 class SimIn(BaseModel):
@@ -62,6 +78,7 @@ class SubmitIn(BaseModel):
 class ReviewIn(BaseModel):
     action: str                 # approve / reject
     note: Optional[str] = ""
+    stage: Optional[int] = None  # 多级审核流中要处理的审核级（0 起）
 
 
 class AppealIn(BaseModel):
@@ -99,6 +116,17 @@ def _dump(model) -> dict:
 def _definition(req: DefinitionIn) -> dict:
     d = _dump(req)
     d["milestones"] = [_dump(m) for m in req.milestones]
+    d.pop("unlock_rule", None)
+    d.pop("review_flow", None)
+    return d
+
+
+def _review_flow(req: DefinitionIn):
+    """取出审核流配置；字段缺省返回 None（创建=默认流，发版=沿用当前版本）。"""
+    if req.review_flow is None:
+        return None
+    d = _dump(req.review_flow)
+    d["stages"] = [_dump(s) for s in (req.review_flow.stages or [])]
     return d
 
 
@@ -135,6 +163,8 @@ def _error(e: Exception) -> HTTPException:
         return HTTPException(403, str(e))
     if isinstance(e, (ch_svc.ReviewConflict, ch_svc.AppealConflict)):
         return HTTPException(409, str(e))
+    if isinstance(e, ch_svc.StageConflict):
+        return HTTPException(409, str(e))
     if isinstance(e, ch_svc.ReviewerConflict):
         return HTTPException(409, str(e))
     return HTTPException(400, str(e))
@@ -151,22 +181,31 @@ def list_challenges():
 
 @router.post("", status_code=201)
 def create_challenge(req: CreateChallengeIn):
-    """发布新挑战：校验定义后创建挑战主体与不可变的 v1 版本。"""
+    """发布新挑战：校验定义后创建挑战主体与不可变的 v1 版本（含多级审核流）。"""
     try:
         with SessionLocal() as db:
             return ch_svc.create_challenge(
                 db, title=req.title, author=req.author,
                 definition=_definition(req),
-                unlock_rule=_dump(req.unlock_rule) if req.unlock_rule else None)
+                unlock_rule=_dump(req.unlock_rule) if req.unlock_rule else None,
+                review_flow=_review_flow(req))
     except (ch_svc.ValidationError,) as e:
         raise _error(e)
 
 
 @router.get("/review_queue")
-def review_queue(status: str = "pending", limit: int = 100):
-    """全站成绩提交队列（默认待审核），供审核工作流使用。"""
+def review_queue(status: str = "pending", limit: int = 100,
+                 stage: Optional[int] = None,
+                 x_reviewer_token: Optional[str] = Header(default=None)):
+    """全站成绩队列（默认待审核）；多级审核流按当前审核级展示。
+
+    - ?stage=N 只看第 N 级（各版本级编号一致过滤）；
+    - 带 X-Reviewer-Token 时每条附 can_review（名单/角色是否匹配当前级）。
+    """
     with SessionLocal() as db:
-        return {"submissions": ch_svc.list_submissions(db, status=status, limit=limit)}
+        return {"submissions": ch_svc.list_submissions(
+            db, status=status, limit=limit, stage=stage,
+            reviewer_token=_token(x_reviewer_token))}
 
 
 @router.get("/submissions/{record_id}")
@@ -203,10 +242,12 @@ def appeal_submission(record_id: int, req: AppealIn):
 
 
 @router.get("/appeals")
-def appeals(status: str = "pending", limit: int = 50):
-    """申诉队列（默认待复核），供复核员工作流使用。"""
+def appeals(status: str = "pending", limit: int = 50,
+            route: Optional[str] = None):
+    """申诉队列（默认待复核）；?route=stage 只看回到审核级重审的申诉。"""
     with SessionLocal() as db:
-        return {"appeals": ch_svc.list_appeals(db, status=status, limit=limit)}
+        return {"appeals": ch_svc.list_appeals(db, status=status, route=route,
+                                               limit=limit)}
 
 
 @router.get("/mine/submissions")
@@ -290,15 +331,20 @@ def create_reviewer(req: ReviewerIn,
 @router.post("/submissions/{record_id}/review")
 def review_submission(record_id: int, req: ReviewIn,
                       x_reviewer_token: Optional[str] = Header(default=None)):
-    """初审成绩：通过后进入排行榜、开放回放并联动解锁；驳回则排除。"""
+    """审核当前级：多级通过后逐级流转，末级通过才上榜/回放/联动解锁；驳回则排除。
+
+    多级审核流须显式带 stage（当前等待的审核级）；申诉回到审核级的成绩也在此
+    处理（该级通过=推翻并继续流转，驳回=维持原判）。
+    """
     try:
         with SessionLocal() as db:
             return ch_svc.review(db, record_id=record_id,
                                  action=req.action, note=req.note or "",
-                                 reviewer_token=_token(x_reviewer_token))
+                                 reviewer_token=_token(x_reviewer_token),
+                                 stage=req.stage)
     except (ch_svc.ValidationError, ch_svc.SubmissionNotFound,
-            ch_svc.ReviewConflict, ch_svc.UnauthorizedReviewer,
-            ch_svc.ForbiddenReviewer) as e:
+            ch_svc.ReviewConflict, ch_svc.StageConflict,
+            ch_svc.UnauthorizedReviewer, ch_svc.ForbiddenReviewer) as e:
         raise _error(e)
 
 
@@ -314,12 +360,14 @@ def challenge_detail(challenge_id: int):
 
 @router.post("/{challenge_id}/versions", status_code=201)
 def publish_version(challenge_id: int, req: VersionIn):
-    """发布新版本：定义落库为不可变版本并设为当前版本（旧版本保留）。"""
+    """发布新版本：定义与审核流落库为不可变版本并设为当前版本（旧版本保留）。"""
     try:
         with SessionLocal() as db:
             kwargs = {}
             if req.unlock_rule is not None:
                 kwargs["unlock_rule"] = _dump(req.unlock_rule)
+            if req.review_flow is not None:
+                kwargs["review_flow"] = _review_flow(req)
             return ch_svc.publish_version(db, challenge_id,
                                           definition=_definition(req), **kwargs)
     except (ch_svc.ValidationError, ch_svc.ChallengeNotFound) as e:
@@ -391,13 +439,15 @@ def submit(challenge_id: int, req: SubmitIn):
 
 @router.get("/{challenge_id}/submissions")
 def challenge_submissions(challenge_id: int, status: str = "pending",
-                          limit: int = 50):
-    """某挑战的成绩提交列表（默认待审核队列）。"""
+                          limit: int = 50, stage: Optional[int] = None,
+                          x_reviewer_token: Optional[str] = Header(default=None)):
+    """某挑战的成绩提交列表（默认待审核队列，可按审核级过滤）。"""
     try:
         with SessionLocal() as db:
             ch_svc.get_playable(db, challenge_id)  # 存在性校验
             return {"submissions": ch_svc.list_submissions(
-                db, challenge_id=challenge_id, status=status, limit=limit)}
+                db, challenge_id=challenge_id, status=status, limit=limit,
+                stage=stage, reviewer_token=_token(x_reviewer_token))}
     except ch_svc.ChallengeNotFound as e:
         raise _error(e)
 

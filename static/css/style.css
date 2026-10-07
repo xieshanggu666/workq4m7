@@ -358,6 +358,36 @@ body {
 .btn.mini.ghost { border-color: rgba(255,255,255,0.25); color: var(--muted); }
 .btn.mini:disabled { opacity: 0.35; cursor: default; }
 
+/* 多级审核流 */
+.flow-switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; color: var(--text); }
+.flow-editor {
+  border: 1px dashed rgba(90,220,255,0.4); border-radius: 12px;
+  padding: 12px 14px; margin: 8px 0 4px; background: rgba(90,220,255,0.05);
+}
+.stage-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+.stage-no { flex-shrink: 0; font-size: 12px; color: var(--cyan); width: 48px; }
+.stage-name { width: 130px; flex-shrink: 0; }
+.stage-reviewers { flex: 1; min-width: 180px; }
+.stage-sla { width: 130px; flex-shrink: 0; }
+.flow-route { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); margin-top: 8px; }
+.stage-tag {
+  font-size: 11px; color: var(--cyan); border: 1px solid rgba(90,220,255,0.5);
+  border-radius: 10px; padding: 1px 8px; margin-left: 6px;
+}
+.stage-named { font-size: 11px; color: #c9a0ff; margin-left: 6px; }
+.sla-tag {
+  font-size: 11px; color: var(--red); border: 1px solid rgba(255,123,143,0.5);
+  border-radius: 10px; padding: 1px 8px; margin-left: 6px;
+}
+.sla-ok { font-size: 11px; color: var(--muted); margin-left: 6px; }
+.queue-row.sla-row { border-color: rgba(255,123,143,0.4); }
+.stage-chip {
+  display: inline-block; font-size: 11px; margin-right: 6px;
+  padding: 1px 8px; border-radius: 10px; border: 1px solid var(--line); color: var(--muted);
+}
+.stage-chip.done { color: var(--green); border-color: rgba(124,232,184,0.5); }
+.stage-chip.current { color: var(--gold); border-color: rgba(255,212,121,0.6); }
+
 /* 排行榜内"我的提交" */
 .board-mine { margin-top: 14px; border-top: 1px solid rgba(255,255,255,0.12); padding-top: 10px; }
 .board-mine h4 { font-size: 13px; color: var(--muted); margin-bottom: 8px; font-weight: normal; }

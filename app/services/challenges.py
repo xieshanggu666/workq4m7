@@ -1,21 +1,30 @@
-"""社区航线挑战服务：版本化发布 / 幂等提交 / 审核 / 申诉与复核 / 排行榜 / 回放 / 解锁联动。
+"""社区航线挑战服务：版本化发布 / 幂等提交 / 按版本多级审核 / 申诉队列路由 / 排行榜 / 回放 / 解锁联动。
 
 设计要点：
-- 版本化：每次发布生成不可变的 ChallengeVersion（预算 + 里程碑 + 时间限制），
-  飞行记录与成绩都锚定具体版本；排行榜按版本结算，旧版本仍可查看与回放。
+- 版本化：每次发布生成不可变的 ChallengeVersion（预算 + 里程碑 + 时间限制 +
+  审核流 review_flow），飞行记录与成绩都锚定具体版本；排行榜按版本结算，
+  旧版本仍可查看与回放，其审核流也随之固化、不可修改。
+- 多级审核流：review_flow 含 1~5 个审核级（名称/角色 reviewer|moderator/
+  指定审核人名单/SLA 时限）与申诉去向（appeal_route：moderator=复核员裁决、
+  stage=回到驳回级重审）。提交进第 1 级，逐级通过，末级通过才 approved；
+  任意一级 reject 即落选。未配置的版本（含全部历史版本）降级为默认单级流，
+  行为与旧版一致。
+- 申诉队列路由：route=moderator 的申诉进复核员队列由其 uphold/overturn；
+  route=stage 的申诉把成绩重置到驳回级（SLA 重新计时），由该级审核人在
+  审核接口裁决——该级通过=推翻驳回并继续向后流转（可能还有后续级），
+  再驳回=维持原判。revoked（上榜后撤销）始终由复核员受理。
 - 幂等结算：/run 落库执行档案（ChallengeRun），/submit 以 submission_id 为幂等键
   关联档案落库成绩；重复提交（双击/重试/多标签页）返回首个结果，不重复计数。
-- 审核联动：成绩默认 pending；审核通过（approved）后才进入排行榜、开放轨迹回放，
-  并计入解锁条件。解锁状态按规则实时求值，审核通过即自动联动，无需额外迁移。
-- 申诉与复核：玩家可对 rejected/revoked 成绩凭 appeal_id 幂等键发起申诉（每成绩
-  至多 2 轮、同时仅 1 条），成绩回到 pending 进入复核队列；复核员（moderator）
-  维持原判(uphold→回到原状态)或推翻原判(overturn→approved)。复核员还可撤销
-  (revoke)/恢复(restore)已上榜成绩；排行榜/回放/解锁全部按状态实时求值，
-  撤销即自动出榜、关闭回放并级联回收解锁，接口返回前后 diff 的回滚效果。
-- 可追溯：每次状态迁移追加一条不可变的 ChallengeReviewEvent（提交/初审/申诉/
-  复核/撤销/恢复）；历史已审核成绩在启动时补登 legacy 事件，链路不断档。
+- 审核联动：仅末级通过（approved）的成绩才进入排行榜、开放轨迹回放，并计入
+  解锁条件。解锁状态按规则实时求值，审核通过即自动联动，无需额外迁移。
+- 撤销/恢复：复核员可 revoke 上榜成绩（出榜、关回放、级联回收解锁）或
+  restore（重新上榜/回放/解锁）；接口返回前后 diff 的回滚效果，均幂等。
+- 可追溯：每次状态迁移追加一条不可变的 ChallengeReviewEvent（提交/逐级
+  通过驳回/申诉/裁决/撤销/恢复，事件详情带审核级名称与级次）；历史已审核
+  成绩在启动时补登 legacy 事件，旧库 pending 成绩补齐当前级与 SLA 起算时间。
 - 审核权限：Reviewer 分 reviewer（初审）/moderator（复核、撤销、注册）两级，
-  token 经 X-Reviewer-Token 上送；内置本地账号开箱即用，缺省调用降级为内置初审员。
+  token 经 X-Reviewer-Token 上送；审核级可指定名单，名单为空则该角色全员
+  可处理；内置本地账号开箱即用，缺省调用降级为内置初审员。
 - 并发安全：模块级锁串行化提交/审核/申诉临界区（SQLite 单写者），唯一约束兜底。
 """
 from __future__ import annotations
@@ -63,11 +72,29 @@ ROLE_MODERATOR = "moderator"
 MAX_APPEAL_ROUNDS = 2
 MAX_APPEAL_REASON = 500
 
+# 多级审核流
+MAX_REVIEW_STAGES = 5
+STAGE_NAME_MAX = 24
+SLA_MIN_HOURS, SLA_MAX_HOURS = 0.5, 24 * 30
+# 申诉去向：moderator=复核员队列裁决（默认）；stage=回到驳回时的审核级重审
+APPEAL_ROUTE_MODERATOR = "moderator"
+APPEAL_ROUTE_STAGE = "stage"
+
 # 内置审核账号（本地单机开箱即用；正式部署可禁用/改 token）
 BUILTIN_REVIEWERS = [
     {"name": "本机初审员", "token": "local-reviewer", "role": ROLE_REVIEWER},
     {"name": "本机复核员", "token": "local-moderator", "role": ROLE_MODERATOR},
 ]
+
+
+def default_review_flow() -> dict:
+    """缺省审核流：单级初审（所有初审员可处理）+ 复核员受理申诉。
+
+    旧版本与未配置审核流的版本统一按此降级，历史行为完全不变。
+    """
+    return {"stages": [{"name": "初审", "role": ROLE_REVIEWER,
+                        "reviewers": [], "sla_hours": None}],
+            "appeal_route": APPEAL_ROUTE_MODERATOR}
 
 
 # ---------- 异常 ----------
@@ -122,6 +149,10 @@ class AppealConflict(RuntimeError):
 
 class ReviewerConflict(ValueError):
     """审核员署名或 token 冲突。"""
+
+
+class StageConflict(RuntimeError):
+    """审核级不匹配（成绩当前不在该审核级，或该级不由该队列处理）。"""
 
 
 # ---------- 定义校验 ----------
@@ -217,14 +248,86 @@ def validate_unlock_rule(db, rule, self_id: Optional[int] = None) -> Optional[di
     raise ValidationError(f"未知解锁条件类型: {t}")
 
 
+def validate_review_flow(db, flow) -> Optional[dict]:
+    """校验按版本配置的多级审核流；None / 空 dict 表示用默认流（返回 None）。
+
+    结构：{"stages": [{"name", "role", "reviewers", "sla_hours"}],
+           "appeal_route": "moderator" | "stage"}
+    - 1~MAX_REVIEW_STAGES 个审核级，名称不可重复；
+    - role 限定 reviewer/moderator；reviewers 为显式指定审核人署名（可空=
+      该角色全员可处理），署名必须是已注册且角色匹配、未停用的账号；
+    - sla_hours 为该级审核时限（小时，可空=不限时），仅用于超时提示；
+    - appeal_route=stage 时申诉回到驳回时的审核级，由该级指定审核人裁决。
+    """
+    if not flow:
+        return None
+    if not isinstance(flow, dict):
+        raise ValidationError("审核流配置必须是对象")
+    stages_in = flow.get("stages")
+    if not isinstance(stages_in, list) or not stages_in:
+        raise ValidationError("审核流至少配置 1 个审核级")
+    if len(stages_in) > MAX_REVIEW_STAGES:
+        raise ValidationError(f"审核级最多 {MAX_REVIEW_STAGES} 级")
+    known = {r.name: r for r in db.query(Reviewer).all()}
+    stages, names = [], set()
+    for i, st in enumerate(stages_in, 1):
+        st = st or {}
+        name = _clean_text(st.get("name"), STAGE_NAME_MAX, f"第 {i} 级名称")
+        if name in names:
+            raise ValidationError(f"审核级名称重复: {name}")
+        names.add(name)
+        role = st.get("role") or ROLE_REVIEWER
+        if role not in (ROLE_REVIEWER, ROLE_MODERATOR):
+            raise ValidationError(f"第 {i} 级角色未知: {role}")
+        raw_reviewers = st.get("reviewers") or []
+        if not isinstance(raw_reviewers, list):
+            raise ValidationError(f"第 {i} 级审核人必须是署名列表")
+        reviewers = []
+        for rn in raw_reviewers:
+            rn = (rn or "").strip()
+            if not rn:
+                continue
+            if len(rn) > 24:
+                raise ValidationError(f"第 {i} 级审核人署名过长: {rn}")
+            acc = known.get(rn)
+            if acc is None or not acc.active:
+                raise ValidationError(f"第 {i} 级指定的审核人不存在或已停用: {rn}")
+            if acc.role != role:
+                raise ValidationError(
+                    f"审核人「{rn}」是{'复核员' if acc.role == ROLE_MODERATOR else '初审员'}"
+                    f"，与第 {i} 级要求的角色不匹配")
+            if rn not in reviewers:
+                reviewers.append(rn)
+        sla = st.get("sla_hours")
+        if sla is not None and sla != "":
+            try:
+                sla = float(sla)
+            except (TypeError, ValueError):
+                raise ValidationError(f"第 {i} 级审核时限必须是数字（小时）")
+            if not SLA_MIN_HOURS <= sla <= SLA_MAX_HOURS:
+                raise ValidationError(
+                    f"第 {i} 级审核时限需在 {SLA_MIN_HOURS}~{SLA_MAX_HOURS} 小时之间")
+        else:
+            sla = None
+        stages.append({"name": name, "role": role,
+                       "reviewers": reviewers, "sla_hours": sla})
+    route = flow.get("appeal_route") or APPEAL_ROUTE_MODERATOR
+    if route not in (APPEAL_ROUTE_MODERATOR, APPEAL_ROUTE_STAGE):
+        raise ValidationError(f"未知申诉去向: {route}")
+    return {"stages": stages, "appeal_route": route}
+
+
 # ---------- 发布（版本化） ----------
 
-def _add_version(db, challenge_id: int, version: int, defn: dict) -> ChallengeVersion:
+def _add_version(db, challenge_id: int, version: int, defn: dict,
+                 review_flow: Optional[dict] = None) -> ChallengeVersion:
     ver = ChallengeVersion(
         challenge_id=challenge_id, version=version,
         name=defn["name"], brief=defn["brief"], hint=defn["hint"],
         budget_dv=defn["budget_dv"], t_max=defn["t_max"],
         milestones_json=json.dumps(defn["milestones"], ensure_ascii=False),
+        review_flow_json=json.dumps(review_flow, ensure_ascii=False)
+                             if review_flow else "",
         created_at=time.time(),
     )
     db.add(ver)
@@ -232,31 +335,42 @@ def _add_version(db, challenge_id: int, version: int, defn: dict) -> ChallengeVe
 
 
 def create_challenge(db, *, title: str, author: str, definition: dict,
-                     unlock_rule=None) -> dict:
-    """发布新挑战：创建挑战主体 + 不可变的 v1 版本。"""
+                     unlock_rule=None, review_flow=None) -> dict:
+    """发布新挑战：创建挑战主体 + 不可变的 v1 版本（含多级审核流配置）。"""
     title = _clean_text(title, 40, "挑战标题")
     author = _clean_text(author, 24, "设计者署名", allow_empty=True) or "匿名设计者"
     defn = validate_definition(definition)
+    bootstrap(db)  # 审核流可能指定审核人：确保内置账号已播种
     rule = validate_unlock_rule(db, unlock_rule)
+    flow = validate_review_flow(db, review_flow)
     ch = Challenge(title=title, author=author, status="published", current_version=1,
                    unlock_rule_json=json.dumps(rule) if rule else "",
                    created_at=time.time())
     db.add(ch)
     db.flush()  # 取 challenge.id
-    _add_version(db, ch.id, 1, defn)
+    _add_version(db, ch.id, 1, defn, flow)
     db.commit()
     return challenge_detail(db, ch.id)
 
 
 def publish_version(db, challenge_id: int, definition: dict,
-                    unlock_rule=_KEEP_RULE) -> dict:
+                    unlock_rule=_KEEP_RULE, review_flow=_KEEP_RULE) -> dict:
     """发布新版本：定义校验后落库为不可变版本并设为当前版本。
 
     unlock_rule 缺省（未传）时保留原解锁条件；显式传 {"type":"none"} 可清除。
+    review_flow 缺省时沿用当前版本的审核流；显式传 {"stages": [...]} 为新版本
+    配置独立的多级审核流，传 {"stages": [], ...} 以外的"空配置"（None 字段）
+    即恢复默认单级流。
     """
     ch = _get_challenge(db, challenge_id)
     defn = validate_definition(definition)
-    _add_version(db, ch.id, ch.current_version + 1, defn)
+    cur = _get_version(db, ch.id, ch.current_version)
+    bootstrap(db)  # 审核流可能指定审核人：确保内置账号已播种
+    if review_flow is _KEEP_RULE:
+        flow = _flow_of(cur)
+    else:
+        flow = validate_review_flow(db, review_flow)
+    _add_version(db, ch.id, ch.current_version + 1, defn, flow)
     ch.current_version += 1
     if unlock_rule is not _KEEP_RULE:
         rule = validate_unlock_rule(db, unlock_rule, self_id=ch.id)
@@ -292,6 +406,33 @@ def level_def(ver: ChallengeVersion) -> dict:
         "milestones": json.loads(ver.milestones_json),
         "budget_dv": ver.budget_dv,
         "t_max": ver.t_max,
+    }
+
+
+def _flow_of(ver: ChallengeVersion) -> Optional[dict]:
+    """版本上的审核流原始配置（None=默认流）。"""
+    return json.loads(ver.review_flow_json) if ver.review_flow_json else None
+
+
+def flow_of(ver: ChallengeVersion) -> dict:
+    """版本生效的审核流（未配置时降级为默认单级流）。"""
+    return _flow_of(ver) or default_review_flow()
+
+
+def _public_stage(st: dict, index: int) -> dict:
+    return {"stage": index, "name": st["name"], "role": st["role"],
+            "reviewers": list(st.get("reviewers") or []),
+            "sla_hours": st.get("sla_hours")}
+
+
+def public_flow(ver: ChallengeVersion) -> dict:
+    """对外展示的审核流（含是否自定义、逐级信息与申诉去向）。"""
+    raw = _flow_of(ver)
+    flow = raw or default_review_flow()
+    return {
+        "custom": raw is not None,
+        "stages": [_public_stage(st, i) for i, st in enumerate(flow["stages"])],
+        "appeal_route": flow["appeal_route"],
     }
 
 
@@ -437,6 +578,7 @@ def list_challenges(db) -> List[dict]:
             "budget_dv": v.budget_dv if v else 0.0,
             "t_max": v.t_max if v else 0.0,
             "milestone_count": len(json.loads(v.milestones_json)) if v else 0,
+            "review_stages": len(flow_of(v)["stages"]) if v else 1,
             "unlocked": unlocked, "unlock_desc": desc,
             "best": best.get(ch.id),
             "best_current": best_current.get(ch.id),
@@ -465,12 +607,14 @@ def challenge_detail(db, challenge_id: int) -> dict:
             "version": v.version, "name": v.name,
             "budget_dv": v.budget_dv, "t_max": v.t_max,
             "milestone_count": len(json.loads(v.milestones_json)),
+            "review_flow": public_flow(v),
             "created_at": v.created_at,
         } for v in vers],
         "current": {
             "version": cur.version, "name": cur.name, "brief": cur.brief,
             "hint": cur.hint, "budget_dv": cur.budget_dv, "t_max": cur.t_max,
             "milestones": json.loads(cur.milestones_json),
+            "review_flow": public_flow(cur),
         },
         "best": _best_approved(db).get(ch.id),
         "best_current": _best_current_approved(db).get(ch.id),
@@ -486,6 +630,7 @@ def version_detail(db, challenge_id: int, version: int) -> dict:
         "version": ver.version, "name": ver.name, "brief": ver.brief,
         "hint": ver.hint, "budget_dv": ver.budget_dv, "t_max": ver.t_max,
         "milestones": json.loads(ver.milestones_json),
+        "review_flow": public_flow(ver),
         "is_current": ver.version == ch.current_version,
         "created_at": ver.created_at,
     }
@@ -527,8 +672,10 @@ def record_run(db, ch: Challenge, ver: ChallengeVersion, actions: List[dict],
     return run
 
 
-def _submitted_response(rec: ChallengeSubmission, duplicated: bool) -> dict:
-    return {
+def _submitted_response(rec: ChallengeSubmission, duplicated: bool,
+                        ver: Optional[ChallengeVersion] = None) -> dict:
+    flow = flow_of(ver) if ver is not None else None
+    out = {
         "saved": True,
         "duplicated": duplicated,
         "record_id": rec.id,
@@ -537,6 +684,15 @@ def _submitted_response(rec: ChallengeSubmission, duplicated: bool) -> dict:
         "review_status": rec.review_status,
         "stars": rec.stars,
     }
+    if flow is not None and rec.review_status == PENDING:
+        out["review_stage"] = rec.review_stage or 0
+        st = flow["stages"][out["review_stage"]]
+        out["review_stage_name"] = st["name"]
+        out["review_stage_count"] = len(flow["stages"])
+        if st.get("sla_hours"):
+            out["sla_deadline"] = (rec.stage_entered_at or rec.created_at) \
+                + st["sla_hours"] * 3600
+    return out
 
 
 def submit(db, *, challenge_id: int, run_id: str, submission_id: Optional[str],
@@ -566,6 +722,8 @@ def submit(db, *, challenge_id: int, run_id: str, submission_id: Optional[str],
             raise RunNotFound(f"执行记录不存在: {run_id}")
         if run.challenge_id != challenge_id:
             raise RunChallengeMismatch("执行记录与挑战不匹配")
+        ver = _get_version(db, run.challenge_id, run.version)
+        now = time.time()
 
         # 3) 落库成绩记录（(challenge_id, submission_id) 唯一约束兜底并发重复）
         rec = ChallengeSubmission(
@@ -578,7 +736,10 @@ def submit(db, *, challenge_id: int, run_id: str, submission_id: Optional[str],
             fuel_used=run.fuel_used,
             elapsed_days=run.elapsed_days,
             review_status="pending",
-            created_at=time.time(),
+            review_stage=0,  # 进入版本审核流的第 1 级队列
+            review_stages_json="[]",
+            stage_entered_at=now,
+            created_at=now,
         )
         db.add(rec)
         try:
@@ -590,15 +751,17 @@ def submit(db, *, challenge_id: int, run_id: str, submission_id: Optional[str],
                              ChallengeSubmission.challenge_id == challenge_id)
                      .first())
             if dup is not None:
-                return _submitted_response(dup, duplicated=True)
+                dup_ver = _get_version(db, dup.challenge_id, dup.version)
+                return _submitted_response(dup, duplicated=True, ver=dup_ver)
             raise
         _add_event(db, rec, kind=EV_SUBMIT, actor=rec.player,
                    actor_role="player",
                    detail={"submission_id": rec.submission_id,
                            "challenge_id": rec.challenge_id, "version": rec.version,
-                           "stars": rec.stars, "fuel_used": rec.fuel_used})
+                           "stars": rec.stars, "fuel_used": rec.fuel_used,
+                           "review_flow": public_flow(ver)})
         db.commit()
-        return _submitted_response(rec, duplicated=False)
+        return _submitted_response(rec, duplicated=False, ver=ver)
 
 
 # ---------- 审核权限 / 历史兼容 ----------
@@ -688,6 +851,9 @@ def _sqlite_migrate(db) -> None:
     """对旧库做增量迁移（SQLite ALTER/表重建，全程幂等）。
 
     - challenge_submission 补 reviewed_by 列（历史库兼容）；
+    - challenge_submission 再补多级审核列（review_stage / review_stages_json /
+      stage_entered_at），challenge_version 补 review_flow_json，
+      challenge_appeal 补 route（多级审核流升级，旧库一律默认单级流）；
     - 幂等键唯一约束由全局 (submission_id) 收窄为作用域复合唯一：
       challenge_submission(challenge_id, submission_id)、
       score_record(level_id, submission_id)，避免不同挑战/关卡复用同一键串成绩。
@@ -714,9 +880,39 @@ def _sqlite_migrate(db) -> None:
                 conn.execute(
                     "ALTER TABLE challenge_submission ADD COLUMN reviewed_by VARCHAR(24)")
                 conn.commit()
+            # 多级审核流相关列（旧库默认值即"默认单级流"语义）
+            if cols and "review_stage" not in cols:
+                conn.execute(
+                    "ALTER TABLE challenge_submission ADD COLUMN review_stage INTEGER")
+                conn.commit()
+            if cols and "review_stages_json" not in cols:
+                conn.execute(
+                    "ALTER TABLE challenge_submission ADD COLUMN "
+                    "review_stages_json TEXT NOT NULL DEFAULT '[]'")
+                conn.commit()
+            if cols and "stage_entered_at" not in cols:
+                conn.execute(
+                    "ALTER TABLE challenge_submission ADD COLUMN stage_entered_at FLOAT")
+                conn.commit()
             changed |= _rebuild_scoped_unique(
                 conn, "challenge_submission", "challenge_id",
                 "uq_chsub_challenge_submission")
+        if "challenge_version" in tables:
+            cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(challenge_version)").fetchall()}
+            if cols and "review_flow_json" not in cols:
+                conn.execute(
+                    "ALTER TABLE challenge_version ADD COLUMN "
+                    "review_flow_json TEXT NOT NULL DEFAULT ''")
+                conn.commit()
+        if "challenge_appeal" in tables:
+            cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(challenge_appeal)").fetchall()}
+            if cols and "route" not in cols:
+                conn.execute(
+                    "ALTER TABLE challenge_appeal ADD COLUMN "
+                    "route VARCHAR(16) NOT NULL DEFAULT 'moderator'")
+                conn.commit()
         if "score_record" in tables:
             changed |= _rebuild_scoped_unique(
                 conn, "score_record", "level_id",
@@ -769,6 +965,28 @@ def _backfill_legacy_events(db) -> None:
         db.commit()
 
 
+def _backfill_review_stages(db) -> None:
+    """旧库 pending 成绩补齐多级审核字段：进入第 1 级，SLA 从提交时起算。
+
+    终态（approved/rejected/revoked）成绩的 review_stage 缺省按 0 解读，
+    不强制改写；只有仍在排队的 pending 必须有明确级次才能进正确队列。
+    """
+    rows = (db.query(ChallengeSubmission)
+              .filter(ChallengeSubmission.review_status == PENDING,
+                      ChallengeSubmission.review_stage.is_(None))
+              .all())
+    n = 0
+    for rec in rows:
+        rec.review_stage = 0
+        if rec.stage_entered_at is None:
+            rec.stage_entered_at = rec.created_at
+        if not (rec.review_stages_json or "").strip():
+            rec.review_stages_json = "[]"
+        n += 1
+    if n:
+        db.commit()
+
+
 _BOOTSTRAP_LOCK = threading.Lock()
 _BOOTSTRAPPED = False
 
@@ -785,6 +1003,7 @@ def bootstrap(db) -> None:
             return
         _sqlite_migrate(db)
         _seed_reviewers(db)
+        _backfill_review_stages(db)
         _backfill_legacy_events(db)
         _BOOTSTRAPPED = True
 
@@ -902,19 +1121,99 @@ def _effects(db, before: dict, rec: ChallengeSubmission, *,
     }
 
 
-# ---------- 审核 ----------
+# ---------- 审核（多级审核流） ----------
+
+def _version_of_submission(db, rec: ChallengeSubmission) -> ChallengeVersion:
+    return _get_version(db, rec.challenge_id, rec.version)
+
+
+def _stage_history(rec: ChallengeSubmission) -> list:
+    try:
+        h = json.loads(rec.review_stages_json or "[]")
+        return h if isinstance(h, list) else []
+    except (ValueError, TypeError):
+        return []
+
+
+def _stage_sla_status(rec: ChallengeSubmission, stage: dict,
+                      now: float) -> dict:
+    """当前级的 SLA 状态：deadline/剩余/是否超时（仅提示，不做自动流转）。"""
+    sla = stage.get("sla_hours")
+    if not sla or rec.review_status != PENDING:
+        return {"sla_hours": sla or None, "sla_deadline": None,
+                "sla_overdue": False, "sla_remaining_hours": None}
+    entered = rec.stage_entered_at or rec.created_at
+    deadline = entered + sla * 3600
+    return {"sla_hours": sla, "sla_deadline": deadline,
+            "sla_overdue": now > deadline,
+            "sla_remaining_hours": round((deadline - now) / 3600, 2)}
+
+
+def _stage_view(db, rec: ChallengeSubmission, *, now: Optional[float] = None) -> dict:
+    """一条 pending 成绩在当前审核级上的完整视图（队列/详情共用）。"""
+    now = now if now is not None else time.time()
+    ver = _version_of_submission(db, rec)
+    flow = flow_of(ver)
+    stages = flow["stages"]
+    idx = rec.review_stage or 0
+    if idx >= len(stages):  # 防御：旧数据/配置错位时停在末级
+        idx = len(stages) - 1
+    st = stages[idx]
+    out = {
+        "review_stage": idx,
+        "review_stage_name": st["name"],
+        "review_stage_index": idx + 1,
+        "review_stage_count": len(stages),
+        "review_stage_role": st["role"],
+        "review_stage_reviewers": list(st.get("reviewers") or []),
+        "appeal_route": flow["appeal_route"],
+        "stage_history": _stage_history(rec),
+    }
+    out.update(_stage_sla_status(rec, st, now))
+    return out
+
+
+def _stage_allows(stage: dict, rv: Reviewer) -> bool:
+    """该审核人能否处理这个审核级。
+
+    指定审核人名单（reviewers 非空）时只有名单内署名可处理；
+    名单为空则该角色全员可处理；复核员角色始终高于初审员。
+    """
+    named = stage.get("reviewers") or []
+    if named:
+        return rv.name in named
+    if stage["role"] == ROLE_MODERATOR:
+        return rv.role == ROLE_MODERATOR
+    return rv.role in (ROLE_REVIEWER, ROLE_MODERATOR)
+
+
+def _append_stage(rec, *, stage: dict, idx: int, action: str, actor: str,
+                  note: str, now: float) -> None:
+    hist = _stage_history(rec)
+    hist.append({"stage": idx, "name": stage["name"], "action": action,
+                 "actor": actor, "note": note, "created_at": now})
+    rec.review_stages_json = json.dumps(hist, ensure_ascii=False)
+
 
 def review(db, *, record_id: int, action: str, note: str = "",
-           reviewer_token: Optional[str] = None) -> dict:
-    """初审状态机：pending → approved / rejected（需要初审员权限）。
+           reviewer_token: Optional[str] = None,
+           stage: Optional[int] = None) -> dict:
+    """多级审核状态机：在版本配置的当前审核级上 approve/reject。
 
-    申诉重审中的 pending 成绩不能在此直接终审（请走复核裁决接口）。
-    幂等：重复同一终审动作返回当前状态（duplicated=True）；
-    已终审的成绩再作相反动作 → ReviewConflict(409)。
+    - 提交后进入第 1 级；某级 approve 进入下一级，末级 approve 才 approved
+      （进入排行榜/回放/解锁）；任意一级 reject 即 rejected。
+    - 审核级可指定审核人（名单外 403）、角色（复核级初审员 403）与时限（超时标记）。
+    - appeal_route=stage 的版本，申诉成绩回到驳回级由该级重审：该级 approve
+      视为推翻原判并继续向后流转（可能还有后续级），reject 视为维持原判。
+    - appeal_route=moderator（默认）时申诉中成绩只能走复核裁决接口。
+    - 多级流程须显式带 stage（当前级）防误处理；级不匹配 → StageConflict(409)。
+    - 幂等：重复同一终审动作返回当前状态（duplicated=True）；
+      已终审的成绩再作相反动作 → ReviewConflict(409)。
     """
     if action not in _REVIEW_ACTIONS:
         raise ValidationError(f"未知审核动作: {action}")
     target = _REVIEW_ACTIONS[action]
+    # 锁外先做轻量凭证校验（无 token 降级内置初审员）；级级授权在锁内判定
     rv = authenticate(db, reviewer_token, required_role=ROLE_REVIEWER)
     with _LOCK:
         rec = (db.query(ChallengeSubmission)
@@ -922,39 +1221,164 @@ def review(db, *, record_id: int, action: str, note: str = "",
                  .first())
         if rec is None:
             raise SubmissionNotFound(f"成绩记录不存在: {record_id}")
+        ver = _version_of_submission(db, rec)
+        flow = flow_of(ver)
+        stages = flow["stages"]
+        cur_idx = rec.review_stage or 0
+        open_appeal = _open_appeal(db, rec.id)
         before = _snapshot_effects(db)
         replay_before = rec.review_status == APPROVED
-        open_appeal = _open_appeal(db, rec.id)
-        if rec.review_status == target:
-            return _review_response(rec, target, duplicated=True,
-                                    actor=rv.name, effects=_effects(
-                                        db, before, rec, replayable_before=replay_before))
-        if rec.review_status != PENDING:
+        now = time.time()
+
+        def resp(duplicated: bool) -> dict:
+            return _review_response(
+                rec, target if rec.review_status == target else rec.review_status,
+                duplicated=duplicated, actor=rv.name, ver=ver,
+                effects=_effects(db, before, rec, replayable_before=replay_before))
+
+        # 已终审：幂等 / 冲突（与历史行为一致）
+        if rec.review_status in (APPROVED, REJECTED, REVOKED):
+            if rec.review_status == target and open_appeal is None:
+                return resp(duplicated=True)
             raise ReviewConflict(
                 f"成绩已审核（{rec.review_status}），不能重复审核")
+
+        # pending：定位审核级
+        if cur_idx >= len(stages):
+            raise StageConflict("审核级配置与成绩状态不一致")
+        if stage is not None and stage != cur_idx:
+            raise StageConflict(
+                f"成绩当前在第 {cur_idx + 1} 级「{stages[cur_idx]['name']}」"
+                f"，不能按第 {stage + 1} 级处理")
+        if len(stages) > 1 and stage is None:
+            raise StageConflict(
+                f"该版本为多级审核（{len(stages)} 级），请指定要处理的审核级")
+        st = stages[cur_idx]
+        if not _stage_allows(st, rv):
+            named = st.get("reviewers") or []
+            if named:
+                raise ForbiddenReviewer(
+                    f"第 {cur_idx + 1} 级「{st['name']}」仅限指定审核人处理："
+                    + "、".join(named))
+            raise ForbiddenReviewer(
+                f"第 {cur_idx + 1} 级「{st['name']}」需要复核员权限")
+        note = (note or "").strip()[:200]
+
+        # 申诉重审中的成绩：按版本 appeal_route 决定处理方式
         if open_appeal is not None:
-            raise ReviewConflict(
-                "成绩正在申诉复核中，请通过复核裁决（uphold/overturn）处理")
-        rec.review_status = target
-        rec.review_note = (note or "").strip()[:200]
-        rec.reviewed_by = rv.name
-        rec.reviewed_at = time.time()
-        _add_event(db, rec, kind=EV_REVIEW[target], actor=rv.name,
-                   actor_role=ROLE_REVIEWER,
-                   detail={"note": rec.review_note})
+            if open_appeal.route != APPEAL_ROUTE_STAGE:
+                raise ReviewConflict(
+                    "成绩正在复核员申诉裁决中，请通过复核裁决（uphold/overturn）处理")
+            appeal = open_appeal
+            if action == "reject":
+                # 该级重审驳回 = 维持原判
+                appeal.status = APPEAL_UPHOLD
+                appeal.decision_note = note
+                appeal.decided_by = rv.name
+                appeal.decided_at = now
+                rec.review_status = appeal.from_status
+                rec.review_note = note
+                rec.reviewed_by = rv.name
+                rec.reviewed_at = now
+                _add_event(db, rec, kind=EV_APPEAL_DECISION[APPEAL_UPHOLD],
+                           actor=rv.name, actor_role=st["role"],
+                           detail={"round": appeal.round,
+                                   "from_status": appeal.from_status,
+                                   "stage": cur_idx, "stage_name": st["name"],
+                                   "note": note}, appeal=appeal)
+                db.commit()
+                return _appeal_stage_response(
+                    rec, ver, appeal, APPEAL_UPHOLD, duplicated=False, actor=rv.name,
+                    effects=_effects(db, before, rec, replayable_before=replay_before))
+            # 该级重审通过 = 推翻驳回，继续向后流转（可能还有后续级）
+            appeal.status = APPEAL_OVERTURN
+            appeal.decision_note = note
+            appeal.decided_by = rv.name
+            appeal.decided_at = now
+            _add_event(db, rec, kind=EV_APPEAL_DECISION[APPEAL_OVERTURN],
+                       actor=rv.name, actor_role=st["role"],
+                       detail={"round": appeal.round,
+                               "from_status": appeal.from_status,
+                               "stage": cur_idx, "stage_name": st["name"],
+                               "note": note}, appeal=appeal)
+            _advance_approved(db, rec, st, cur_idx, rv, note, now, ver,
+                              include_stage_event=False)
+            db.commit()
+            return _appeal_stage_response(
+                rec, ver, appeal, APPEAL_OVERTURN, duplicated=False, actor=rv.name,
+                effects=_effects(db, before, rec, replayable_before=replay_before))
+
+        # 常规审核：驳回即终态
+        if action == "reject":
+            rec.review_status = REJECTED
+            rec.review_note = note
+            rec.reviewed_by = rv.name
+            rec.reviewed_at = now
+            _append_stage(rec, stage=st, idx=cur_idx, action="reject",
+                          actor=rv.name, note=note, now=now)
+            _add_event(db, rec, kind=EV_REVIEW[REJECTED], actor=rv.name,
+                       actor_role=st["role"],
+                       detail={"stage": cur_idx, "stage_name": st["name"],
+                               "note": note})
+            db.commit()
+            return resp(duplicated=False)
+
+        # 常规通过：末级 → approved，否则进入下一级队列
+        _advance_approved(db, rec, st, cur_idx, rv, note, now, ver)
         db.commit()
-        return _review_response(rec, target, duplicated=False,
-                                actor=rv.name,
-                                effects=_effects(db, before, rec,
-                                                 replayable_before=replay_before))
+        return resp(duplicated=False)
+
+
+def _advance_approved(db, rec, stage, idx, rv, note, now, ver,
+                      *, include_stage_event: bool = True) -> None:
+    """某级通过后的统一推进：记录该级结果，末级上榜、否则进入下一级队列。"""
+    _append_stage(rec, stage=stage, idx=idx, action="approve",
+                  actor=rv.name, note=note, now=now)
+    if include_stage_event:
+        _add_event(db, rec, kind=EV_REVIEW[APPROVED], actor=rv.name,
+                   actor_role=stage["role"],
+                   detail={"stage": idx, "stage_name": stage["name"],
+                           "note": note, "final": idx == len(flow_of(ver)["stages"]) - 1})
+    stages = flow_of(ver)["stages"]
+    if idx + 1 >= len(stages):
+        rec.review_status = APPROVED
+        rec.review_note = note
+        rec.reviewed_by = rv.name
+        rec.reviewed_at = now
+    else:
+        rec.review_stage = idx + 1
+        rec.stage_entered_at = now
+
+
+def _appeal_stage_response(rec, ver, appeal, decision, *, duplicated: bool,
+                           actor: str, effects: dict) -> dict:
+    out = _review_response(rec, rec.review_status, duplicated=duplicated,
+                           actor=actor, ver=ver, effects=effects)
+    out["appeal_id"] = appeal.id
+    out["appeal_round"] = appeal.round
+    out["appeal_decision"] = decision
+    return out
 
 
 def _review_response(rec, status, *, duplicated: bool, actor: str,
-                     effects: Optional[dict] = None) -> dict:
-    return {"record_id": rec.id, "challenge_id": rec.challenge_id,
-            "version": rec.version, "review_status": status,
-            "reviewed_by": actor, "duplicated": duplicated,
-            "effects": effects}
+                     effects: Optional[dict] = None,
+                     ver: Optional[ChallengeVersion] = None) -> dict:
+    out = {"record_id": rec.id, "challenge_id": rec.challenge_id,
+           "version": rec.version, "review_status": status,
+           "reviewed_by": actor, "duplicated": duplicated,
+           "review_stage": rec.review_stage,
+           "stage_history": _stage_history(rec),
+           "effects": effects}
+    if ver is not None and status == PENDING:
+        flow = flow_of(ver)
+        idx = rec.review_stage or 0
+        if idx < len(flow["stages"]):
+            st = flow["stages"][idx]
+            out["review_stage"] = idx
+            out["review_stage_name"] = st["name"]
+            out["review_stage_index"] = idx + 1
+            out["review_stage_count"] = len(flow["stages"])
+    return out
 
 
 def revoke(db, *, record_id: int, note: str = "",
@@ -968,11 +1392,12 @@ def revoke(db, *, record_id: int, note: str = "",
     rv = authenticate(db, moderator_token, required_role=ROLE_MODERATOR)
     with _LOCK:
         rec = _get_submission(db, record_id)
+        ver = _version_of_submission(db, rec)
         before = _snapshot_effects(db)
         replay_before = rec.review_status == APPROVED
         if rec.review_status == REVOKED:
             return _moderation_response(rec, EV_REVOKE, duplicated=True,
-                                        actor=rv.name,
+                                        actor=rv.name, ver=ver,
                                         effects=_effects(db, before, rec,
                                                          replayable_before=replay_before))
         if rec.review_status != APPROVED:
@@ -981,10 +1406,10 @@ def revoke(db, *, record_id: int, note: str = "",
         if _open_appeal(db, rec.id) is not None:
             raise ReviewConflict("成绩正在申诉复核中，不能撤销")
         _reject_terminal(db, rec, status=REVOKED, note=note, reviewer=rv,
-                         kind=EV_REVOKE)
+                         kind=EV_REVOKE, stage_idx=len(flow_of(ver)["stages"]) - 1)
         db.commit()
         return _moderation_response(rec, EV_REVOKE, duplicated=False,
-                                    actor=rv.name,
+                                    actor=rv.name, ver=ver,
                                     effects=_effects(db, before, rec,
                                                      replayable_before=replay_before))
 
@@ -998,45 +1423,54 @@ def restore(db, *, record_id: int, note: str = "",
     rv = authenticate(db, moderator_token, required_role=ROLE_MODERATOR)
     with _LOCK:
         rec = _get_submission(db, record_id)
+        ver = _version_of_submission(db, rec)
         before = _snapshot_effects(db)
         replay_before = rec.review_status == APPROVED
         if rec.review_status == APPROVED:
             return _moderation_response(rec, EV_RESTORE, duplicated=True,
-                                        actor=rv.name,
+                                        actor=rv.name, ver=ver,
                                         effects=_effects(db, before, rec,
                                                          replayable_before=replay_before))
         if rec.review_status != REVOKED:
             raise ReviewConflict(
                 f"只有已撤销的成绩可以恢复（当前 {rec.review_status}）")
+        now = time.time()
         rec.review_status = APPROVED
         rec.review_note = (note or "").strip()[:200]
         rec.reviewed_by = rv.name
-        rec.reviewed_at = time.time()
+        rec.reviewed_at = now
+        # 恢复为已上榜：审核级停在末级（终态）
+        rec.review_stage = len(flow_of(ver)["stages"]) - 1
         _add_event(db, rec, kind=EV_RESTORE, actor=rv.name,
                    actor_role=ROLE_MODERATOR,
                    detail={"note": rec.review_note})
         db.commit()
         return _moderation_response(rec, EV_RESTORE, duplicated=False,
-                                    actor=rv.name,
+                                    actor=rv.name, ver=ver,
                                     effects=_effects(db, before, rec,
                                                      replayable_before=replay_before))
 
 
 def _moderation_response(rec, action_kind, *, duplicated: bool, actor: str,
-                         effects: dict) -> dict:
+                         effects: dict, ver=None) -> dict:
     return {"record_id": rec.id, "challenge_id": rec.challenge_id,
             "version": rec.version, "action": action_kind,
             "review_status": rec.review_status,
             "reviewed_by": actor, "duplicated": duplicated,
+            "review_stage": rec.review_stage,
+            "stage_history": _stage_history(rec),
             "effects": effects}
 
 
 def _reject_terminal(db, rec, *, status: str, note: str, reviewer: Reviewer,
-                     kind: str) -> None:
+                     kind: str, stage_idx: Optional[int] = None) -> None:
+    now = time.time()
     rec.review_status = status
     rec.review_note = (note or "").strip()[:200]
     rec.reviewed_by = reviewer.name
-    rec.reviewed_at = time.time()
+    rec.reviewed_at = now
+    if stage_idx is not None:
+        rec.review_stage = stage_idx
     _add_event(db, rec, kind=kind, actor=reviewer.name,
                actor_role=ROLE_MODERATOR, detail={"note": rec.review_note})
 
@@ -1094,12 +1528,25 @@ def create_appeal(db, *, record_id: int, player: str, reason: str,
                     .count())
         if rounds >= MAX_APPEAL_ROUNDS:
             raise AppealConflict(f"每条成绩最多申诉 {MAX_APPEAL_ROUNDS} 次")
+        ver = _version_of_submission(db, rec)
+        flow = flow_of(ver)
+        # revoked（上榜后撤销）始终由复核员受理；rejected 的去向按版本配置：
+        # appeal_route=stage 时回到驳回时的审核级，由该级指定审核人重审。
+        if rec.review_status == REVOKED or flow["appeal_route"] != APPEAL_ROUTE_STAGE:
+            route = APPEAL_ROUTE_MODERATOR
+            reenter_stage = None
+        else:
+            route = APPEAL_ROUTE_STAGE
+            hist = _stage_history(rec)
+            rejected = [h for h in hist if h.get("action") == "reject"]
+            reenter_stage = rejected[-1]["stage"] if rejected else (rec.review_stage or 0)
+        now = time.time()
         appeal = ChallengeAppeal(
             appeal_uid=appeal_id or uuid.uuid4().hex,
             submission_id=rec.id, round=rounds + 1,
             from_status=rec.review_status, player=player,
-            reason=reason, status=APPEAL_PENDING,
-            created_at=time.time())
+            reason=reason, status=APPEAL_PENDING, route=route,
+            created_at=now)
         db.add(appeal)
         try:
             db.flush()
@@ -1109,11 +1556,17 @@ def create_appeal(db, *, record_id: int, player: str, reason: str,
                      .filter(ChallengeAppeal.appeal_uid == appeal.appeal_uid)
                      .first())
             return _appeal_response(dup, duplicated=True)
-        # 成绩回到待复核队列；排行榜/回放/解锁因状态变化自动回滚
+        # 成绩回到待审队列：route=stage 回驳回级（SLA 重新计时），
+        # route=moderator 保持当前级但只接受复核裁决；排行榜/回放/解锁随状态回滚。
         rec.review_status = PENDING
+        if route == APPEAL_ROUTE_STAGE:
+            rec.review_stage = reenter_stage
+            rec.stage_entered_at = now
         _add_event(db, rec, kind=EV_APPEAL, actor=player, actor_role="player",
                    detail={"round": appeal.round,
                            "from_status": appeal.from_status,
+                           "route": route,
+                           "stage": rec.review_stage,
                            "reason": reason}, appeal=appeal)
         db.commit()
         return _appeal_response(appeal, duplicated=False)
@@ -1137,8 +1590,13 @@ def decide_appeal(db, *, appeal_id_key: int, decision: str, note: str = "",
         if appeal is None:
             raise AppealNotFound(f"申诉记录不存在: {appeal_id_key}")
         rec = _get_submission(db, appeal.submission_id)
+        ver = _version_of_submission(db, rec)
         before = _snapshot_effects(db)
         replay_before = rec.review_status == APPROVED
+        # route=stage 的申诉由驳回级审核人在审核接口裁决，复核员不直接处理
+        if appeal.status == APPEAL_PENDING and appeal.route == APPEAL_ROUTE_STAGE:
+            raise ReviewConflict(
+                "该申诉配置为回到驳回审核级重审，请由该级审核人在审核队列处理")
         if appeal.status != APPEAL_PENDING:
             decided = "overturn" if appeal.status == APPEAL_OVERTURN else "uphold"
             if decided == decision:
@@ -1157,10 +1615,15 @@ def decide_appeal(db, *, appeal_id_key: int, decision: str, note: str = "",
         rec.review_note = appeal.decision_note
         rec.reviewed_by = rv.name
         rec.reviewed_at = time.time()
+        # 复核员推翻直接上榜 → 停在末级；维持 → 回到原终态级
+        last_stage = len(flow_of(ver)["stages"]) - 1
+        rec.review_stage = last_stage if decision == APPEAL_OVERTURN else \
+            (rec.review_stage or 0)
         _add_event(db, rec, kind=EV_APPEAL_DECISION[decision], actor=rv.name,
                    actor_role=ROLE_MODERATOR,
                    detail={"round": appeal.round,
                            "from_status": appeal.from_status,
+                           "route": appeal.route,
                            "note": appeal.decision_note},
                    appeal=appeal)
         db.commit()
@@ -1175,6 +1638,7 @@ def _appeal_response(ap: ChallengeAppeal, *, duplicated: bool) -> dict:
             "appeal_id": ap.id, "appeal_uid": ap.appeal_uid,
             "record_id": ap.submission_id, "round": ap.round,
             "from_status": ap.from_status, "status": ap.status,
+            "route": ap.route,
             "review_status": PENDING}
 
 
@@ -1189,11 +1653,22 @@ def _appeal_decision_response(ap, rec, decision, *, duplicated: bool,
 
 
 def list_appeals(db, *, status: str = APPEAL_PENDING,
+                 route: Optional[str] = None,
                  limit: int = 50) -> List[dict]:
-    """申诉队列：默认待复核（moderator 工作流）。"""
+    """申诉队列：默认待复核（moderator 工作流）。
+
+    route=moderator 只回复核员裁决队列；route=stage 只回回到审核级重审的申诉。
+    缺省（待裁决视图）只含 moderator 路由，避免复核员看到不归其处理的申诉；
+    显式 route=all 可查看全部。
+    """
     q = db.query(ChallengeAppeal)
     if status in (APPEAL_PENDING, APPEAL_UPHOLD, APPEAL_OVERTURN):
         q = q.filter(ChallengeAppeal.status == status)
+    if route is None:
+        # 缺省只回复核员受理的申诉（route=stage 的在审核队列处理）
+        q = q.filter(ChallengeAppeal.route == APPEAL_ROUTE_MODERATOR)
+    elif route in (APPEAL_ROUTE_MODERATOR, APPEAL_ROUTE_STAGE):
+        q = q.filter(ChallengeAppeal.route == route)
     rows = (q.order_by(ChallengeAppeal.id.desc())
              .limit(max(1, min(200, limit))).all())
     sub_ids = {a.submission_id for a in rows}
@@ -1204,7 +1679,7 @@ def list_appeals(db, *, status: str = APPEAL_PENDING,
     out = []
     for a in rows:
         s = subs.get(a.submission_id)
-        out.append({
+        item = {
             "appeal_id": a.id, "record_id": a.submission_id,
             "challenge_id": s.challenge_id if s else None,
             "challenge_title": titles.get(s.challenge_id, f"#{s.challenge_id}")
@@ -1212,13 +1687,25 @@ def list_appeals(db, *, status: str = APPEAL_PENDING,
             "version": s.version if s else None,
             "player": a.player, "round": a.round,
             "from_status": a.from_status, "status": a.status,
+            "route": a.route,
             "reason": a.reason, "decision_note": a.decision_note,
             "decided_by": a.decided_by,
             "stars": s.stars if s else None,
             "fuel_used": s.fuel_used if s else None,
             "elapsed_days": s.elapsed_days if s else None,
             "created_at": a.created_at, "decided_at": a.decided_at,
-        })
+        }
+        if s is not None and a.status == APPEAL_PENDING:
+            item["review_stage"] = s.review_stage or 0
+            ver = _get_version(db, s.challenge_id, s.version)
+            flow = flow_of(ver)
+            idx = item["review_stage"]
+            if idx < len(flow["stages"]):
+                st = flow["stages"][idx]
+                item["review_stage_name"] = st["name"]
+                item["review_stage_reviewers"] = list(st.get("reviewers") or [])
+                item["review_stage_role"] = st["role"]
+        out.append(item)
     return out
 
 
@@ -1235,11 +1722,18 @@ def player_submissions(db, player: str, *, challenge_id: Optional[int] = None,
     rows = (q.order_by(ChallengeSubmission.id.desc())
              .limit(max(1, min(200, limit))).all())
     titles = {c.id: c.title for c in db.query(Challenge).all()}
+    versions = {(v.challenge_id, v.version): v
+                for v in db.query(ChallengeVersion).all()}
     out = []
     for r in rows:
         ap = _open_appeal(db, r.id)
         rounds = (db.query(ChallengeAppeal)
                     .filter(ChallengeAppeal.submission_id == r.id).count())
+        ver = versions.get((r.challenge_id, r.version))
+        flow = flow_of(ver) if ver is not None else default_review_flow()
+        stages = flow["stages"]
+        cur_idx = r.review_stage or 0
+        st = stages[cur_idx] if cur_idx < len(stages) else stages[-1]
         out.append({
             "record_id": r.id, "challenge_id": r.challenge_id,
             "challenge_title": titles.get(r.challenge_id, f"#{r.challenge_id}"),
@@ -1247,6 +1741,12 @@ def player_submissions(db, player: str, *, challenge_id: Optional[int] = None,
             "fuel_used": r.fuel_used, "elapsed_days": r.elapsed_days,
             "review_status": r.review_status, "review_note": r.review_note,
             "reviewed_by": r.reviewed_by,
+            "review_stage": cur_idx,
+            "review_stage_name": st["name"],
+            "review_stage_index": min(cur_idx + 1, len(stages)),
+            "review_stage_count": len(stages),
+            "stage_history": _stage_history(r),
+            "appeal_route": flow["appeal_route"],
             "appeal_rounds": rounds,
             "appeal_open": ap.id if ap else None,
             "appeal_available": (
@@ -1268,6 +1768,9 @@ def submission_timeline(db, record_id: int) -> Optional[dict]:
     if rec is None:
         return None
     ch = db.query(Challenge).filter(Challenge.id == rec.challenge_id).first()
+    ver = _get_version(db, rec.challenge_id, rec.version)
+    flow = flow_of(ver)
+    cur_idx = rec.review_stage or 0
     events = (db.query(ChallengeReviewEvent)
                 .filter(ChallengeReviewEvent.submission_id == rec.id)
                 .order_by(ChallengeReviewEvent.id)
@@ -1285,6 +1788,13 @@ def submission_timeline(db, record_id: int) -> Optional[dict]:
         "elapsed_days": rec.elapsed_days,
         "review_status": rec.review_status, "review_note": rec.review_note,
         "reviewed_by": rec.reviewed_by,
+        "review_flow": public_flow(ver),
+        "review_stage": cur_idx,
+        "review_stage_name": (flow["stages"][cur_idx]["name"]
+                              if cur_idx < len(flow["stages"]) else None),
+        "review_stage_index": min(cur_idx + 1, len(flow["stages"])),
+        "review_stage_count": len(flow["stages"]),
+        "stage_history": _stage_history(rec),
         "appeal_rounds": len(appeals),
         "appeal_open": _open_appeal(db, rec.id) is not None,
         "appeal_available": (
@@ -1301,6 +1811,7 @@ def submission_timeline(db, record_id: int) -> Optional[dict]:
         } for i, e in enumerate(events)],
         "appeals": [{
             "appeal_id": a.id, "round": a.round, "from_status": a.from_status,
+            "route": a.route,
             "reason": a.reason, "status": a.status,
             "decision_note": a.decision_note, "decided_by": a.decided_by,
             "created_at": a.created_at, "decided_at": a.decided_at,
@@ -1309,8 +1820,15 @@ def submission_timeline(db, record_id: int) -> Optional[dict]:
 
 
 def list_submissions(db, *, challenge_id: Optional[int] = None,
-                     status: str = "pending", limit: int = 50) -> List[dict]:
-    """成绩提交列表：默认待审核队列（含申诉重审，附 appeal 标记），可按挑战过滤。"""
+                     status: str = "pending", limit: int = 50,
+                     stage: Optional[int] = None,
+                     reviewer_token: Optional[str] = None) -> List[dict]:
+    """成绩提交列表：默认待审核队列（多级审核按当前级展示，附申诉/SLA 标记）。
+
+    - stage= 指定只看某个审核级（按各版本自己的级编号）；
+    - 提供 reviewer_token 时为每条待审成绩计算 can_review（名单/角色是否匹配）；
+      申诉中且 route=moderator 的成绩对审核队列标记 can_review=false。
+    """
     q = db.query(ChallengeSubmission)
     if challenge_id is not None:
         q = q.filter(ChallengeSubmission.challenge_id == challenge_id)
@@ -1320,12 +1838,28 @@ def list_submissions(db, *, challenge_id: Optional[int] = None,
              .limit(max(1, min(200, limit)))
              .all())
     titles = {c.id: c.title for c in db.query(Challenge).all()}
+    versions = {(v.challenge_id, v.version): v
+                for v in db.query(ChallengeVersion).all()}
+    rv = None
+    if reviewer_token:
+        try:
+            rv = authenticate(db, reviewer_token, required_role=ROLE_REVIEWER)
+        except (UnauthorizedReviewer, ForbiddenReviewer):
+            rv = None
+    now = time.time()
     result = []
     for r in rows:
         ap = _open_appeal(db, r.id)
         rounds = (db.query(ChallengeAppeal)
                     .filter(ChallengeAppeal.submission_id == r.id).count())
-        result.append({
+        ver = versions.get((r.challenge_id, r.version))
+        flow = flow_of(ver) if ver is not None else default_review_flow()
+        stages = flow["stages"]
+        cur_idx = r.review_stage or 0
+        if stage is not None and cur_idx != stage:
+            continue
+        st = stages[cur_idx] if cur_idx < len(stages) else stages[-1]
+        item = {
             "record_id": r.id,
             "challenge_id": r.challenge_id,
             "challenge_title": titles.get(r.challenge_id, f"#{r.challenge_id}"),
@@ -1337,12 +1871,34 @@ def list_submissions(db, *, challenge_id: Optional[int] = None,
             "review_status": r.review_status,
             "review_note": r.review_note,
             "reviewed_by": r.reviewed_by,
+            "review_stage": cur_idx,
+            "review_stage_name": st["name"],
+            "review_stage_index": min(cur_idx + 1, len(stages)),
+            "review_stage_count": len(stages),
+            "review_stage_role": st["role"],
+            "review_stage_reviewers": list(st.get("reviewers") or []),
+            "appeal_route": flow["appeal_route"],
+            "stage_history": _stage_history(r),
             "appeal_open": ap.id if ap else None,
             "appeal_round": ap.round if ap else None,
             "appeal_reason": ap.reason if ap else None,
+            "appeal_route_open": ap.route if ap else None,
             "appeal_rounds_total": rounds,
             "created_at": r.created_at,
-        })
+        }
+        item.update(_stage_sla_status(r, st, now))
+        if r.review_status == PENDING:
+            if ap is not None and ap.route == APPEAL_ROUTE_MODERATOR:
+                item["can_review"] = False
+                item["queue_kind"] = "moderator_appeal"
+            elif rv is not None:
+                item["can_review"] = _stage_allows(st, rv)
+                item["queue_kind"] = ("stage_appeal" if ap is not None
+                                      else "stage")
+            else:
+                item["can_review"] = None  # 未提供凭证：不判定，仅展示
+                item["queue_kind"] = "stage_appeal" if ap is not None else "stage"
+        result.append(item)
     return result
 
 
@@ -1403,6 +1959,10 @@ def submission_detail(db, record_id: int) -> Optional[dict]:
     open_ap = _open_appeal(db, rec.id)
     rounds = (db.query(ChallengeAppeal)
                 .filter(ChallengeAppeal.submission_id == rec.id).count())
+    ver = _get_version(db, rec.challenge_id, rec.version)
+    flow = flow_of(ver)
+    cur_idx = rec.review_stage or 0
+    st_view = _stage_view(db, rec) if rec.review_status == PENDING else None
     detail = {
         "record_id": rec.id,
         "challenge_id": rec.challenge_id,
@@ -1414,14 +1974,25 @@ def submission_detail(db, record_id: int) -> Optional[dict]:
         "review_status": rec.review_status,
         "review_note": rec.review_note,
         "reviewed_by": rec.reviewed_by,
+        "review_flow": public_flow(ver),
+        "review_stage": cur_idx,
+        "review_stage_name": (flow["stages"][cur_idx]["name"]
+                              if cur_idx < len(flow["stages"]) else None),
+        "review_stage_index": min(cur_idx + 1, len(flow["stages"])),
+        "review_stage_count": len(flow["stages"]),
+        "stage_history": _stage_history(rec),
         "appeal_rounds": rounds,
         "appeal_open": open_ap.id if open_ap else None,
+        "appeal_route_open": open_ap.route if open_ap else None,
         "appeal_available": (
             rec.review_status in (REJECTED, REVOKED)
             and open_ap is None and rounds < MAX_APPEAL_ROUNDS),
         "replayable": rec.review_status == "approved",
         "created_at": rec.created_at,
     }
+    if st_view is not None:
+        detail.update({k: st_view[k] for k in (
+            "sla_hours", "sla_deadline", "sla_overdue", "sla_remaining_hours")})
     if detail["replayable"]:
         run = (db.query(ChallengeRun)
                  .filter(ChallengeRun.id == rec.run_id)

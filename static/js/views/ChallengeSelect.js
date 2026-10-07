@@ -5,7 +5,7 @@ window.ChallengeSelect = {
   data() {
     return {
       mode: "list",          // list | publish | review
-      reviewTab: "queue",    // queue=初审 appeals=复核 archive=终审管理 mine=我的成绩
+      reviewTab: "queue",    // queue=审核队列 appeals=申诉复核 archive=终审管理 mine=我的成绩
       form: null,
       publishErr: "",
       publishing: false,
@@ -19,7 +19,9 @@ window.ChallengeSelect = {
       timeline: null,
       timelineLoading: false,
       moderatorToken: Store.get("modToken") || "local-moderator",
+      reviewerToken: Store.get("revToken") || "",
       actionErr: "",
+      stageFilter: "",        // 审核队列按级过滤（""=全部）
     };
   },
   computed: {
@@ -61,6 +63,17 @@ window.ChallengeSelect = {
       return { pending: "tag-pending", approved: "tag-ok",
                rejected: "tag-bad", revoked: "tag-warn" }[s] || "";
     },
+    roleLabel(r) {
+      return r === "moderator" ? "复核员" : "初审员";
+    },
+    stageBadge(r) {
+      if (!r || r.review_stage_count == null) return "";
+      return `第 ${r.review_stage_index || ((r.review_stage || 0) + 1)}/${r.review_stage_count} 级 · ${r.review_stage_name || ""}`;
+    },
+    fmtSla(ts) {
+      if (!ts) return "";
+      return this.fmtDateTime(ts);
+    },
     eventLabel(k) {
       return {
         submit: "玩家提交", review_approve: "初审通过", review_reject: "初审驳回",
@@ -72,9 +85,16 @@ window.ChallengeSelect = {
     eventDetail(e) {
       const d = e.detail || {};
       if (e.kind === "submit") return `★${d.stars} · 服务端结算`;
-      if (e.kind === "appeal") return `第 ${d.round} 轮（原判 ${this.statusLabel(d.from_status)}）：${d.reason || ""}`;
+      if (e.kind === "appeal")
+        return `第 ${d.round} 轮（原判 ${this.statusLabel(d.from_status)}${
+          d.route === "stage" ? " · 回到审核级重审" : ""}）：${d.reason || ""}`;
       if (e.kind === "appeal_uphold" || e.kind === "appeal_overturn")
-        return `第 ${d.round} 轮${d.note ? "：" + d.note : ""}`;
+        return `第 ${d.round} 轮${d.stage_name ? " · " + d.stage_name : ""}${d.note ? "：" + d.note : ""}`;
+      if ((e.kind === "review_approve" || e.kind === "review_reject")
+          && d.stage_name) {
+        const verb = e.kind === "review_approve" ? "通过" : "驳回";
+        return `${d.stage_name}（第 ${(d.stage || 0) + 1} 级）${verb}${d.final ? " · 终审上榜" : ""}${d.note ? "：" + d.note : ""}`;
+      }
       return d.note || "";
     },
     enter(c) { if (c.unlocked) this.$emit("enter", c); },
@@ -88,7 +108,22 @@ window.ChallengeSelect = {
         budgetKm: 8.0, tMax: 1200,
         milestones: [{ kind: "proximity", planet_id: "mars", dist: 0.18, r: 4.2, name: "" }],
         unlock: { type: "none", level_id: 1, challenge_id: null, value: 5 },
+        // 多级审核流：null=创建时用默认单级流（发版沿用当前版本）；编辑时展开为具体配置
+        flowEnabled: false,
+        stages: [this.blankStage()],
+        appealRoute: "moderator",
       };
+    },
+    blankStage() {
+      return { name: "", role: "reviewer", reviewersText: "", slaHours: null };
+    },
+    addStage() {
+      if (this.form.stages.length >= 5) return;
+      this.form.stages.push(this.blankStage());
+    },
+    removeStage(i) {
+      if (this.form.stages.length <= 1) return;
+      this.form.stages.splice(i, 1);
     },
     openPublish(ch) {
       const f = this.blankForm();
@@ -109,6 +144,17 @@ window.ChallengeSelect = {
           dist: m.dist || 0.18, r: m.r || 4.2,
         }));
         if (d.unlock_rule) f.unlock = { level_id: 1, value: 5, challenge_id: null, ...d.unlock_rule };
+        // 预填当前版本的审核流：自定义多级流才展开编辑，默认单级保持折叠（沿用）
+        const rf = (d.current && d.current.review_flow) || {};
+        if (rf.custom) {
+          f.flowEnabled = true;
+          f.appealRoute = rf.appeal_route || "moderator";
+          f.stages = (rf.stages || []).map(st => ({
+            name: st.name, role: st.role,
+            reviewersText: (st.reviewers || []).join("、"),
+            slaHours: st.sla_hours == null ? null : st.sla_hours,
+          }));
+        }
       }).catch(e => { this.publishErr = e.message; });
     },
     addMs() {
@@ -140,13 +186,32 @@ window.ChallengeSelect = {
         }),
       };
       const rule = f.unlock.type === "none" ? { type: "none" } : { ...f.unlock };
+      // 审核流：仅在设计者显式启用多级配置时随版本提交；否则由后端默认/沿用
+      let reviewFlow = undefined;
+      if (f.flowEnabled) {
+        reviewFlow = {
+          appeal_route: f.appealRoute,
+          stages: f.stages.map((s, i) => ({
+            name: (s.name || "").trim() || `第 ${i + 1} 级`,
+            role: s.role,
+            reviewers: (s.reviewersText || "")
+              .split(/[、,，\s]+/).map(x => x.trim()).filter(Boolean),
+            sla_hours: (s.slaHours === null || s.slaHours === "" || isNaN(+s.slaHours))
+              ? null : +s.slaHours,
+          })),
+        };
+      }
       this.publishing = true;
       this.publishErr = "";
       try {
         if (f.mode === "create") {
-          await API.createChallenge({ title: f.title, author: f.author, ...def, unlock_rule: rule });
+          const payload = { title: f.title, author: f.author, ...def, unlock_rule: rule };
+          if (reviewFlow) payload.review_flow = reviewFlow;
+          await API.createChallenge(payload);
         } else {
-          await API.publishVersion(f.targetId, { ...def, unlock_rule: rule });
+          const payload = { ...def, unlock_rule: rule };
+          if (reviewFlow) payload.review_flow = reviewFlow;
+          await API.publishVersion(f.targetId, payload);
         }
         Store.set("designer", f.author);
         this.mode = "list";
@@ -171,7 +236,7 @@ window.ChallengeSelect = {
       this.actionErr = "";
       try {
         if (tab === "queue") {
-          this.queue = (await API.reviewQueue()).submissions || [];
+          await this.loadQueue();
         } else if (tab === "appeals") {
           this.appeals = (await API.appealsQueue("pending")).appeals || [];
         } else if (tab === "archive") {
@@ -186,6 +251,19 @@ window.ChallengeSelect = {
         this.queueLoading = false;
       }
     },
+    async loadQueue() {
+      this.queueLoading = true;
+      try {
+        const stage = this.stageFilter === "" ? null : Number(this.stageFilter);
+        this.queue = (await API.reviewQueue(stage, this.reviewerToken || null)).submissions || [];
+      } catch (e) {
+        this.actionErr = e.message;
+        this.queue = [];
+      } finally {
+        this.queueLoading = false;
+      }
+    },
+    saveRevToken() { Store.set("revToken", this.reviewerToken); this.loadQueue(); },
     async switchArchive(status) {
       this.archiveStatus = status;
       this.queueLoading = true;
@@ -211,11 +289,12 @@ window.ChallengeSelect = {
     },
     async review(rec, action) {
       try {
-        await API.reviewSubmission(rec.record_id, action, rec._note || "");
-        await this.loadReviewTab("queue");
+        await API.reviewSubmission(rec.record_id, action, rec._note || "",
+                                   this.reviewerToken || null, rec.review_stage);
+        await this.loadQueue();
         this.$emit("refresh");
       } catch (e) {
-        this.actionErr = "初审失败：" + e.message;
+        this.actionErr = "审核失败：" + e.message;
       }
     },
     async decide(ap, decision) {
@@ -318,6 +397,7 @@ window.ChallengeSelect = {
         <p class="brief">{{ c.brief || '（设计者没有留下简介）' }}</p>
         <div class="best-meta">
           设计 {{ c.author }} · 预算 {{ kmps(c.budget_dv) }} km/s · {{ c.milestone_count }} 个里程碑
+          · 🗂 {{ c.review_stages || 1 }} 级审核
           <span v-if="c.pending_count" class="pending-tag">待审 {{ c.pending_count }}</span>
         </div>
         <div class="best-meta" v-if="c.best_current">
@@ -430,6 +510,42 @@ window.ChallengeSelect = {
           + 添加里程碑
         </button>
 
+        <h3 class="form-h3">
+          <label class="flow-switch">
+            <input type="checkbox" v-model="form.flowEnabled">
+            自定义多级审核流（{{ form.flowEnabled ? form.stages.length + ' 级' : '默认单级初审' }}）
+          </label>
+        </h3>
+        <div v-if="form.flowEnabled" class="flow-editor">
+          <p class="form-sub">
+            提交后逐级审核，全部通过才上榜；每级可指定角色、审核人（留空=该角色全员）与审核时限。
+          </p>
+          <div v-for="(st, i) in form.stages" :key="i" class="stage-row">
+            <span class="stage-no">第 {{ i + 1 }} 级</span>
+            <input v-model.trim="st.name" maxlength="24" :placeholder="'级名称（如 初审/终审）'"
+                   class="stage-name">
+            <select v-model="st.role">
+              <option value="reviewer">初审员</option>
+              <option value="moderator">复核员</option>
+            </select>
+            <input v-model.trim="st.reviewersText" maxlength="120"
+                   placeholder="指定审核人署名（、分隔，留空=该角色全员）" class="stage-reviewers">
+            <input type="number" v-model.number="st.slaHours" min="0.5" max="720" step="0.5"
+                   placeholder="时限(小时，可空)" class="stage-sla">
+            <button class="icon-btn danger" @click="removeStage(i)"
+                    :disabled="form.stages.length <= 1">✕</button>
+          </div>
+          <button class="btn chip" @click="addStage" :disabled="form.stages.length >= 5">
+            + 添加审核级（最多 5 级）
+          </button>
+          <label class="flow-route">申诉去向
+            <select v-model="form.appealRoute">
+              <option value="moderator">复核员裁决（默认）</option>
+              <option value="stage">回到驳回级，由该级审核人重审</option>
+            </select>
+          </label>
+        </div>
+
         <p v-if="publishErr" class="form-err">⚠ {{ publishErr }}</p>
         <div class="form-btns">
           <button class="btn ghost" @click="mode = 'list'">取消</button>
@@ -444,11 +560,11 @@ window.ChallengeSelect = {
     <div v-if="mode === 'review'" class="form-wrap">
       <div class="form-panel review-panel">
         <h2>审核工作台
-          <span class="plan-count">初审上榜 · 玩家申诉 · 复核撤销/恢复 · 全链路可追溯</span>
+          <span class="plan-count">多级审核 · 玩家申诉 · 复核撤销/恢复 · 全链路可追溯</span>
         </h2>
         <div class="review-tabs">
           <button :class="{ active: reviewTab === 'queue' }"
-                  @click="loadReviewTab('queue')">🗂 初审队列</button>
+                  @click="loadReviewTab('queue')">🗂 审核队列</button>
           <button :class="{ active: reviewTab === 'appeals' }"
                   @click="loadReviewTab('appeals')">⚖ 申诉复核
             <span v-if="appeals.length" class="badge">{{ appeals.length }}</span></button>
@@ -459,29 +575,57 @@ window.ChallengeSelect = {
         </div>
         <p v-if="actionErr" class="form-err">⚠ {{ actionErr }}</p>
 
-        <!-- 初审队列（含申诉重审条目，标红提示走复核裁决） -->
+        <!-- 审核队列：多级审核流，按版本配置把成绩送到当前审核级 -->
         <template v-if="reviewTab === 'queue'">
+          <div class="archive-bar">
+            <label class="mod-token">审核令牌
+              <input v-model.trim="reviewerToken"
+                     @change="saveRevToken()"
+                     placeholder="留空=本机初审员；复核级填复核员令牌">
+            </label>
+            <label class="mod-token">按级过滤
+              <select v-model="stageFilter" @change="loadQueue()">
+                <option value="">全部审核级</option>
+                <option v-for="n in 5" :key="n" :value="n - 1">第 {{ n }} 级</option>
+              </select>
+            </label>
+          </div>
           <p v-if="queueLoading" class="plan-empty">加载中…</p>
           <p v-else-if="!queue.length" class="plan-empty">没有待审核的飞行记录。</p>
           <div v-for="r in queue" :key="r.record_id" class="queue-row"
-               :class="{ 'appeal-row': r.appeal_open }">
+               :class="{ 'appeal-row': r.appeal_open, 'sla-row': r.sla_overdue }">
             <div class="queue-main">
               <b>#{{ r.challenge_id }} {{ r.challenge_title }}</b>
               <span class="ver-tag">v{{ r.version }}</span>
-              <span v-if="r.appeal_open" class="appeal-tag">第 {{ r.appeal_round }} 轮申诉复核中</span>
+              <span class="stage-tag">{{ stageBadge(r) }} · {{ roleLabel(r.review_stage_role) }}</span>
+              <span v-if="r.review_stage_reviewers && r.review_stage_reviewers.length"
+                    class="stage-named">指定：{{ r.review_stage_reviewers.join('、') }}</span>
+              <span v-if="r.sla_overdue" class="sla-tag">⏰ 已超时限（{{ r.sla_hours }}h）</span>
+              <span v-else-if="r.sla_hours" class="sla-ok">时限 {{ r.sla_hours }}h</span>
+              <span v-if="r.appeal_open && r.appeal_route_open === 'stage'"
+                    class="appeal-tag">第 {{ r.appeal_round }} 轮申诉·回到本级重审</span>
+              <span v-else-if="r.appeal_open" class="appeal-tag">
+                第 {{ r.appeal_round }} 轮申诉待复核员裁决</span>
               <div class="queue-meta">
                 {{ r.player }} · ★{{ r.stars }} · {{ kmps(r.fuel_used) }} km/s
                 · {{ Math.round(r.elapsed_days) }} 天 · {{ fmtDate(r.created_at) }}
               </div>
-              <div v-if="r.appeal_open" class="queue-meta appeal-reason">
-                申诉理由：{{ r.appeal_reason }}（请在「申诉复核」页裁决，初审不可直接终审）
+              <div v-if="r.appeal_open && r.appeal_route_open === 'stage'"
+                   class="queue-meta appeal-reason">
+                申诉理由：{{ r.appeal_reason }}（本级通过=推翻并继续流转，驳回=维持原判）
+              </div>
+              <div v-else-if="r.appeal_open" class="queue-meta appeal-reason">
+                申诉理由：{{ r.appeal_reason }}（请在「申诉复核」页裁决，审核队列不可处理）
               </div>
             </div>
             <input class="queue-note" v-model.trim="r._note" maxlength="200"
-                   placeholder="审核备注（可选）" :disabled="!!r.appeal_open">
-            <button class="btn mini approve" :disabled="!!r.appeal_open"
+                   placeholder="审核备注（可选）"
+                   :disabled="r.queue_kind === 'moderator_appeal' || r.can_review === false">
+            <button class="btn mini approve"
+                    :disabled="r.queue_kind === 'moderator_appeal' || r.can_review === false"
                     @click="review(r, 'approve')">✓ 通过</button>
-            <button class="btn mini reject" :disabled="!!r.appeal_open"
+            <button class="btn mini reject"
+                    :disabled="r.queue_kind === 'moderator_appeal' || r.can_review === false"
                     @click="review(r, 'reject')">✕ 驳回</button>
             <button class="btn mini ghost" @click="showTimeline(r.record_id)">链路</button>
           </div>
@@ -577,8 +721,10 @@ window.ChallengeSelect = {
               <span class="ver-tag">v{{ r.version }}</span>
               <span :class="'status-tag ' + statusClass(r.review_status)">
                 {{ statusLabel(r.review_status) }}</span>
+              <span v-if="r.review_status === 'pending'" class="stage-tag">
+                {{ stageBadge(r) }}</span>
               <span v-if="r.appeal_open" class="appeal-tag">
-                第 {{ r.appeal_rounds }} 轮申诉复核中</span>
+                第 {{ r.appeal_rounds }} 轮申诉{{ r.appeal_route === 'stage' ? '·回到审核级' : '复核中' }}</span>
               <div class="queue-meta">
                 ★{{ r.stars }} · {{ kmps(r.fuel_used) }} km/s
                 · {{ Math.round(r.elapsed_days) }} 天 · {{ fmtDate(r.created_at) }}
@@ -610,6 +756,18 @@ window.ChallengeSelect = {
           · {{ kmps(timeline.fuel_used) }} km/s
           <span :class="'status-tag ' + statusClass(timeline.review_status)">
             {{ statusLabel(timeline.review_status) }}</span>
+        </p>
+        <p class="modal-reason" v-if="timeline.review_stage_count">
+          审核流 {{ timeline.review_stage_count }} 级：
+          <template v-for="(st, i) in (timeline.review_flow && timeline.review_flow.stages) || []"
+                    :key="i">
+            <span class="stage-chip"
+                  :class="{ done: (timeline.stage_history || []).some(h => h.stage === i),
+                            current: timeline.review_status === 'pending' && timeline.review_stage === i }">
+              {{ i + 1 }}.{{ st.name }}（{{ roleLabel(st.role) }}）</span>
+          </template>
+          ｜ 申诉：{{ timeline.review_flow && timeline.review_flow.appeal_route === 'stage'
+            ? '回到驳回级重审' : '复核员裁决' }}
         </p>
         <ul class="timeline-list">
           <li v-for="e in timeline.events" :key="e.seq" class="tl-item">

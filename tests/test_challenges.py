@@ -107,6 +107,23 @@ def _decide(appeal_id, decision, note="", token=MOD_TOKEN):
                                 token)
 
 
+def _flow_two_stage(**over):
+    """两级审核流：初审（初审员）→ 复核（指定本机复核员），默认复核员受理申诉。"""
+    f = {"stages": [
+        {"name": "初审", "role": "reviewer", "reviewers": [], "sla_hours": 24},
+        {"name": "复核", "role": "moderator",
+         "reviewers": ["本机复核员"], "sla_hours": 48},
+    ], "appeal_route": "moderator"}
+    f.update(over)
+    return f
+
+
+def _review_at(record_id, action, stage, token=None, note=""):
+    return ch_api.review_submission(
+        record_id,
+        ch_api.ReviewIn(action=action, note=note, stage=stage), token)
+
+
 def _submitted(cid, player="飞行员甲", sub_id=None, actions=None):
     """执行 + 提交一条龙，返回提交响应。"""
     import uuid
@@ -899,17 +916,29 @@ def test_legacy_reviewed_submissions_backfill_events():
     rec.reviewed_by = None
     db.commit()
     db.close()
-    # 模拟旧库删除 reviewed_by 列（SQLite 需要重建表）
+    # 模拟旧库删除 reviewed_by 列（SQLite 需要重建表；保留主键/新列，仅去该列）
     conn = sqlite3.connect(DB_PATH)
     cols = [r[1] for r in conn.execute("PRAGMA table_info(challenge_submission)")]
     if "reviewed_by" in cols:
         keep = [c for c in cols if c != "reviewed_by"]
+        defs = []
+        for r in conn.execute("PRAGMA table_info(challenge_submission)").fetchall():
+            if r[1] == "reviewed_by":
+                continue
+            col = f"{r[1]} {r[2] or ''}".strip()
+            if r[5]:  # pk
+                col += " PRIMARY KEY"
+            defs.append(col)
         keep_sql = ", ".join(keep)
         conn.execute("PRAGMA foreign_keys=off")
         conn.execute("ALTER TABLE challenge_submission RENAME TO _cs_old")
         conn.execute(
-            "CREATE TABLE challenge_submission AS SELECT "
-            f"{keep_sql} FROM _cs_old")
+            f"CREATE TABLE challenge_submission ({', '.join(defs)}, "
+            "UNIQUE (challenge_id, submission_id), "
+            "FOREIGN KEY(run_id) REFERENCES challenge_run (id))")
+        conn.execute(
+            f"INSERT INTO challenge_submission ({keep_sql}) "
+            f"SELECT {keep_sql} FROM _cs_old")
         conn.execute("DROP TABLE _cs_old")
         conn.execute("PRAGMA foreign_keys=on")
         conn.commit()
@@ -932,3 +961,320 @@ def test_legacy_reviewed_submissions_backfill_events():
         ChallengeReviewEvent.submission_id == rid).count()
     db.close()
     assert n == 1
+
+
+# ---------- 可配置多级审核流 ----------
+
+def test_review_flow_validation():
+    # 未知角色 / 级过多 / 空级 / SLA 越界 / 指定不存在的审核人 / 角色不匹配
+    bad = [
+        {"stages": [{"name": "X", "role": "wizard"}]},
+        {"stages": [{"name": f"s{i}"} for i in range(6)]},
+        {"stages": []},
+        {"stages": [{"name": "X", "sla_hours": 0.1}]},
+        {"stages": [{"name": "X", "sla_hours": 99999}]},
+        {"stages": [{"name": "X", "reviewers": ["不存在的人"]}]},
+        {"stages": [{"name": "X", "role": "moderator",
+                     "reviewers": ["本机初审员"]}]},
+        {"appeal_route": "mars", "stages": [{"name": "X"}]},
+    ]
+    for flow in bad:
+        with pytest.raises(HTTPException) as e:
+            _create(review_flow=flow)
+        assert e.value.status_code == 400, flow
+    # 同名审核级也不行
+    with pytest.raises(HTTPException) as e:
+        _create(review_flow={"stages": [{"name": "审"}, {"name": "审"}]})
+    assert e.value.status_code == 400
+
+
+def test_review_flow_default_is_single_stage_and_backward_compatible():
+    d = _create()
+    flow = d["current"]["review_flow"]
+    assert flow["custom"] is False and len(flow["stages"]) == 1
+    assert flow["stages"][0]["name"] == "初审"
+    assert flow["appeal_route"] == "moderator"
+    v1 = ch_api.version_detail(d["id"], 1)
+    assert v1["review_flow"]["custom"] is False
+    lst = ch_api.list_challenges()["challenges"][0]
+    assert lst["review_stages"] == 1
+
+
+def test_multistage_submission_progresses_stage_by_stage():
+    d = _create(review_flow=_flow_two_stage())
+    r = _run(d["id"])
+    s = _submit(d["id"], r["run_id"], "ms-1")
+    assert s["review_status"] == "pending"
+    assert s["review_stage"] == 0 and s["review_stage_name"] == "初审"
+    assert s["review_stage_count"] == 2
+    assert s["sla_deadline"]  # 第 1 级 24h 时限
+    # 队列：默认在第 1 级
+    q = ch_api.review_queue()["submissions"]
+    row = next(x for x in q if x["record_id"] == s["record_id"])
+    assert row["review_stage"] == 0 and row["review_stage_name"] == "初审"
+    assert row["review_stage_index"] == 1 and row["review_stage_count"] == 2
+    assert row["sla_overdue"] is False
+    # 第 2 级队列暂时为空
+    assert ch_api.review_queue(stage=1)["submissions"] == []
+
+    # 多级流程不带 stage → 409；错误级 → 409
+    with pytest.raises(HTTPException) as e1:
+        _approve(s["record_id"])
+    assert e1.value.status_code == 409
+    with pytest.raises(HTTPException) as e2:
+        _review_at(s["record_id"], "approve", 1)
+    assert e2.value.status_code == 409
+
+    # 初审员不能处理复核级（即便误带 stage=1，也因成绩不在该级先报 409）
+    # 第 1 级通过：仍不上榜，进入第 2 级队列
+    out1 = _review_at(s["record_id"], "approve", 0)
+    assert out1["review_status"] == "pending"
+    assert out1["review_stage_name"] == "复核"
+    assert ch_api.get_leaderboard(d["id"])["entries"] == []
+    assert ch_api.get_submission(s["record_id"])["replayable"] is False
+    assert len(out1["stage_history"]) == 1
+    q1 = ch_api.review_queue(stage=1)["submissions"]
+    assert [x["record_id"] for x in q1] == [s["record_id"]]
+
+    # 初审员处理第 2 级 → 403（该级指定复核员）
+    with pytest.raises(HTTPException) as e3:
+        _review_at(s["record_id"], "approve", 1, token=REV_TOKEN)
+    assert e3.value.status_code == 403
+    # 复核员通过末级：上榜/回放/解锁
+    out2 = _review_at(s["record_id"], "approve", 1, token=MOD_TOKEN)
+    assert out2["review_status"] == "approved"
+    assert len(out2["stage_history"]) == 2
+    assert len(ch_api.get_leaderboard(d["id"])["entries"]) == 1
+    detail = ch_api.get_submission(s["record_id"])
+    assert detail["replayable"] is True and detail["review_stage_count"] == 2
+    assert [h["action"] for h in detail["stage_history"]] == ["approve", "approve"]
+    tl = ch_api.get_timeline(s["record_id"])
+    assert [e["kind"] for e in tl["events"]] == [
+        "submit", "review_approve", "review_approve"]
+    assert tl["events"][1]["detail"]["stage"] == 0
+    assert tl["events"][2]["detail"]["final"] is True
+
+
+def test_multistage_reject_at_second_stage_excludes():
+    d = _create(review_flow=_flow_two_stage())
+    s, _ = _submitted(d["id"], sub_id="ms-2")
+    _review_at(s["record_id"], "approve", 0)
+    out = _review_at(s["record_id"], "reject", 1, token=MOD_TOKEN, note="复核驳回")
+    assert out["review_status"] == "rejected"
+    assert ch_api.get_leaderboard(d["id"])["entries"] == []
+    assert ch_api.get_submission(s["record_id"])["replayable"] is False
+    # 已驳回不能继续走审核接口
+    with pytest.raises(HTTPException) as e:
+        _review_at(s["record_id"], "approve", 1, token=MOD_TOKEN)
+    assert e.value.status_code == 409
+
+
+def test_multistage_queue_can_review_uses_named_reviewers():
+    # 两级都指定专人：只有名单内审核人的 can_review 为真
+    ch_api.create_reviewer(ch_api.ReviewerIn(
+        name="专家甲", token="t-exp1", role="reviewer"), MOD_TOKEN)
+    flow = {"stages": [
+        {"name": "专家初审", "role": "reviewer", "reviewers": ["专家甲"]},
+        {"name": "终审", "role": "moderator", "reviewers": ["本机复核员"]},
+    ], "appeal_route": "moderator"}
+    d = _create(review_flow=flow)
+    s, _ = _submitted(d["id"], sub_id="ms-3")
+    # 不带 token 不判定（None）
+    row_noauth = next(x for x in ch_api.review_queue()["submissions"]
+                      if x["record_id"] == s["record_id"])
+    assert row_noauth["can_review"] is None
+    # 直接服务层验证名单授权
+    db = SessionLocal()
+    ver = ch_svc._get_version(db, d["id"], 1)
+    stage0 = ch_svc.flow_of(ver)["stages"][0]
+    acc_builtin = ch_svc.authenticate(db, REV_TOKEN)
+    acc_exp = ch_svc.authenticate(db, "t-exp1")
+    acc_mod = ch_svc.authenticate(db, MOD_TOKEN)
+    assert ch_svc._stage_allows(stage0, acc_builtin) is False
+    assert ch_svc._stage_allows(stage0, acc_exp) is True
+    assert ch_svc._stage_allows(stage0, acc_mod) is False
+    db.close()
+    # 队列经 token 计算 can_review
+    row_builtin = next(x for x in ch_api.review_queue(
+        x_reviewer_token=REV_TOKEN)["submissions"]
+        if x["record_id"] == s["record_id"])
+    row_exp = next(x for x in ch_api.review_queue(
+        x_reviewer_token="t-exp1")["submissions"]
+        if x["record_id"] == s["record_id"])
+    assert row_builtin["can_review"] is False
+    assert row_exp["can_review"] is True
+    # 内置初审员越权处理 → 403；专家甲可处理
+    with pytest.raises(HTTPException) as e:
+        _review_at(s["record_id"], "approve", 0, token=REV_TOKEN)
+    assert e.value.status_code == 403
+    _review_at(s["record_id"], "approve", 0, token="t-exp1")
+
+
+def test_sla_overdue_flag():
+    d = _create(review_flow={"stages": [
+        {"name": "快审", "role": "reviewer", "sla_hours": 1.0}]})
+    s, _ = _submitted(d["id"], sub_id="ms-sla")
+    db = SessionLocal()
+    rec = db.query(ChallengeSubmission).filter(
+        ChallengeSubmission.id == s["record_id"]).one()
+    rec.stage_entered_at = rec.created_at - 2 * 3600  # 2 小时前进入 → 超时
+    db.commit()
+    db.close()
+    row = next(x for x in ch_api.review_queue()["submissions"]
+               if x["record_id"] == s["record_id"])
+    assert row["sla_overdue"] is True and row["sla_hours"] == 1.0
+    detail = ch_api.get_submission(s["record_id"])
+    assert detail["sla_overdue"] is True
+
+
+def test_new_version_can_reconfigure_review_flow():
+    d = _create()  # v1 默认单级
+    ch_api.publish_version(d["id"], ch_api.VersionIn(
+        **_def(), review_flow=ch_api.ReviewFlowIn(**_flow_two_stage())))
+    detail = ch_api.challenge_detail(d["id"])
+    assert detail["current"]["version"] == 2
+    assert len(detail["current"]["review_flow"]["stages"]) == 2
+    # v1 仍是默认单级（不可变）
+    v1 = ch_api.version_detail(d["id"], 1)
+    assert len(v1["review_flow"]["stages"]) == 1
+    # v2 提交走两级；v1 提交走单级
+    r2 = ch_api.run(d["id"], ch_api.SimIn(
+        actions=[ch_api.Action(type="burn", angle=90.0, dv=0.0017)], version=2))
+    s2 = _submit(d["id"], r2["run_id"], "ms-v2")
+    assert s2["review_stage_count"] == 2 and s2["version"] == 2
+    r1 = ch_api.run(d["id"], ch_api.SimIn(
+        actions=[ch_api.Action(type="burn", angle=90.0, dv=0.0017)], version=1))
+    s1 = _submit(d["id"], r1["run_id"], "ms-v1")
+    assert s1["review_stage_count"] == 1 and s1["version"] == 1
+
+
+def test_publish_version_keeps_flow_when_unspecified():
+    d = _create(review_flow=_flow_two_stage())
+    # 发新版本不带 review_flow → 沿用当前版本的两级流
+    d2 = ch_api.publish_version(d["id"], ch_api.VersionIn(**_def(name="v2")))
+    assert len(d2["current"]["review_flow"]["stages"]) == 2
+
+
+# ---------- 多级审核流下的申诉队列路由 ----------
+
+def test_appeal_route_stage_reenters_rejecting_stage():
+    flow = _flow_two_stage(appeal_route="stage")
+    d = _create(review_flow=flow)
+    s, _ = _submitted(d["id"], sub_id="route-1")
+    _review_at(s["record_id"], "approve", 0)
+    _review_at(s["record_id"], "reject", 1, token=MOD_TOKEN, note="复核驳回")
+    # 申诉：回到被驳回的第 2 级（stage=1），route=stage
+    ap = _appeal(d["id"], s["record_id"], "补充证据", "route-ap1")
+    assert ap["route"] == "stage"
+    assert _status(s["record_id"]) == "pending"
+    detail = ch_api.get_submission(s["record_id"])
+    assert detail["review_stage"] == 1 and detail["appeal_route_open"] == "stage"
+    # 复核员队列看不到 route=stage 的待裁决申诉；审核队列第 2 级能看到
+    assert ch_api.appeals()["appeals"] == []
+    stage_aps = ch_api.appeals(route="stage")["appeals"]
+    assert [a["appeal_id"] for a in stage_aps] == [ap["appeal_id"]]
+    assert stage_aps[0]["review_stage_name"] == "复核"
+    q = ch_api.review_queue(stage=1)["submissions"]
+    row = next(x for x in q if x["record_id"] == s["record_id"])
+    assert row["appeal_open"] and row["queue_kind"] == "stage_appeal"
+
+    # 复核裁决接口拒绝直接处理 route=stage 的申诉
+    with pytest.raises(HTTPException) as e1:
+        _decide(ap["appeal_id"], "overturn")
+    assert e1.value.status_code == 409
+    # 初审员无权在复核级裁决 → 403
+    with pytest.raises(HTTPException) as e2:
+        _review_at(s["record_id"], "approve", 1, token=REV_TOKEN)
+    assert e2.value.status_code == 403
+    # 该级（复核员）通过 = 推翻原判；末级通过直接上榜
+    out = _review_at(s["record_id"], "approve", 1, token=MOD_TOKEN, note="改判")
+    assert out["review_status"] == "approved"
+    assert out["appeal_decision"] == "overturn"
+    assert len(ch_api.get_leaderboard(d["id"])["entries"]) == 1
+    tl = ch_api.get_timeline(s["record_id"])
+    assert tl["appeals"][0]["status"] == "overturn"
+    assert any(e["kind"] == "appeal_overturn" for e in tl["events"])
+
+
+def test_appeal_route_stage_reject_upholds_and_rejects_at_first_stage():
+    # 单级 + stage 路由：第 1 级驳回后申诉回第 1 级，再驳回=维持 rejected
+    flow = {"stages": [{"name": "审核", "role": "reviewer"}],
+            "appeal_route": "stage"}
+    d = _create(review_flow=flow)
+    s, _ = _submitted(d["id"], sub_id="route-2")
+    _review_at(s["record_id"], "reject", 0, note="不行")
+    ap = _appeal(d["id"], s["record_id"], "再看看", "route-ap2")
+    assert ap["route"] == "stage"
+    # 该级再驳回 = 维持原判
+    out = _review_at(s["record_id"], "reject", 0, note="证据不足")
+    assert out["review_status"] == "rejected"
+    assert out["appeal_decision"] == "uphold"
+    ap_row = ch_api.appeals(status="uphold", route="stage")["appeals"][0]
+    assert ap_row["status"] == "uphold"
+    ap2 = _appeal(d["id"], s["record_id"], "新证据", "route-ap3")
+    out2 = _review_at(s["record_id"], "approve", 0)
+    assert out2["review_status"] == "approved"
+    assert out2["appeal_decision"] == "overturn"
+    assert len(ch_api.get_leaderboard(d["id"])["entries"]) == 1
+
+
+def test_appeal_route_stage_advance_continues_through_later_stages():
+    """第 1 级驳回 → 申诉回第 1 级，该级通过只是"继续往后走"，还要过第 2 级。"""
+    flow = _flow_two_stage(appeal_route="stage")
+    d = _create(review_flow=flow)
+    s, _ = _submitted(d["id"], sub_id="route-3")
+    _review_at(s["record_id"], "reject", 0, note="初审驳回")
+    _appeal(d["id"], s["record_id"], "误判", "route-ap4")
+    # 第 1 级通过：推翻驳回但还没上榜，进入第 2 级
+    out = _review_at(s["record_id"], "approve", 0)
+    assert out["review_status"] == "pending" and out["review_stage"] == 1
+    assert out["appeal_decision"] == "overturn"
+    assert ch_api.get_leaderboard(d["id"])["entries"] == []
+    # 第 2 级通过（普通审核，已无进行中申诉）才上榜
+    out2 = _review_at(s["record_id"], "approve", 1, token=MOD_TOKEN)
+    assert out2["review_status"] == "approved"
+    assert len(ch_api.get_leaderboard(d["id"])["entries"]) == 1
+
+
+def test_revoked_appeal_always_goes_to_moderator_even_with_stage_route():
+    flow = _flow_two_stage(appeal_route="stage")
+    d = _create(review_flow=flow)
+    s, _ = _submitted(d["id"], sub_id="route-4")
+    _review_at(s["record_id"], "approve", 0)
+    _review_at(s["record_id"], "approve", 1, token=MOD_TOKEN)
+    _revoke(s["record_id"])
+    ap = _appeal(d["id"], s["record_id"], "撤销有误", "route-ap5")
+    assert ap["route"] == "moderator"  # 上榜后撤销始终复核员受理
+    assert ch_api.appeals()["appeals"][0]["appeal_id"] == ap["appeal_id"]
+    # 审核级接口不能处理
+    with pytest.raises(HTTPException) as e:
+        _review_at(s["record_id"], "approve", 1, token=MOD_TOKEN)
+    assert e.value.status_code == 409
+    dec = _decide(ap["appeal_id"], "overturn")
+    assert dec["review_status"] == "approved"
+
+
+def test_multistage_revoke_restore_keeps_stage_consistency():
+    d = _create(review_flow=_flow_two_stage())
+    s, _ = _submitted(d["id"], sub_id="route-5")
+    _review_at(s["record_id"], "approve", 0)
+    _review_at(s["record_id"], "approve", 1, token=MOD_TOKEN)
+    rev = _revoke(s["record_id"])
+    assert rev["review_stage"] == 1  # 停在末级
+    assert ch_api.get_submission(s["record_id"])["replayable"] is False
+    restored = _restore(s["record_id"])
+    assert restored["review_status"] == "approved" and restored["review_stage"] == 1
+    assert ch_api.get_submission(s["record_id"])["replayable"] is True
+
+
+def test_pending_count_and_player_view_reflect_multistage():
+    d = _create(review_flow=_flow_two_stage())
+    s, _ = _submitted(d["id"], sub_id="route-6")
+    _review_at(s["record_id"], "approve", 0)  # 进入第 2 级，仍 pending
+    card = next(c for c in ch_api.list_challenges()["challenges"]
+                if c["id"] == d["id"])
+    assert card["pending_count"] == 1 and card["review_stages"] == 2
+    mine = ch_api.my_submissions("飞行员甲")["submissions"][0]
+    assert mine["review_stage"] == 1 and mine["review_stage_name"] == "复核"
+    assert mine["review_stage_index"] == 2 and mine["review_stage_count"] == 2
+    assert mine["replayable"] is False
